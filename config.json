@@ -1,0 +1,19 @@
+{
+"seed": 1234, 
+"lr": 3e-05, 
+"warmup": 1000, 
+"epochs": 1, 
+"num_workers": 4, 
+"limit_val_batches": 0.005, 
+"limit_test_batches": 0.005, 
+"limit_train_batches": 0.002, 
+"max_output_len": 256, 
+"output_dir": "./saved_models/test", 
+"val_every": 0.33, 
+"max_input_len": 8192, 
+"batch_size": 2, 
+"grad_accum": 1, 
+"fp16": false, 
+"grad_ckpt": false, 
+"attention_window": 1024
+}
