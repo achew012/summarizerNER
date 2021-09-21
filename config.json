@@ -8,12 +8,14 @@
 "limit_test_batches": 0.005, 
 "limit_train_batches": 0.002, 
 "max_output_len": 256, 
+"data_dir": "/data",
 "output_dir": "./saved_models/test", 
 "val_every": 0.33, 
 "max_input_len": 8192, 
-"batch_size": 2, 
+"batch_size": 1, 
 "grad_accum": 1, 
 "fp16": false, 
 "grad_ckpt": false, 
-"attention_window": 1024
+"attention_window": 1024,
+"num_epochs": 10
 }

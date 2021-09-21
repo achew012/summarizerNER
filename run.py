@@ -1,70 +1,131 @@
 from clearml import Task, StorageManager, Dataset
 import argparse
-import json
+import json, os
 
 #Task.add_requirements('transformers', package_version='4.2.0')
-task = Task.init(project_name='LangGen', task_name='summarizerNER', output_uri="s3://experiment-logging/storage/")
-task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+# task = Task.init(project_name='LangGen', task_name='summarizerNER', output_uri="s3://experiment-logging/storage/")
+# task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
 
 config = json.load(open('config.json'))
 args = argparse.Namespace(**config)
-task.connect(args)
+# task.connect(args)
 
-task.execute_remotely(queue_name="default", exit_process=True)
-clearlogger = task.get_logger()
+# task.execute_remotely(queue_name="default", exit_process=True)
+# clearlogger = task.get_logger()
 
-import argparse
-import os
 
-#import datasets
+# class bucket_ops:
+#     StorageManager.set_cache_file_limit(5, cache_context=None)
+
+#     def list(remote_path:str):
+#         return StorageManager.list(remote_path, return_full_path=False)
+
+#     def upload_folder(local_path:str, remote_path:str):
+#         StorageManager.upload_folder(local_path, remote_path, match_wildcard=None)
+#         print("Uploaded {}".format(local_path))
+
+#     def download_folder(local_path:str, remote_path:str):
+#         StorageManager.download_folder(remote_path, local_path, match_wildcard=None, overwrite=True)
+#         print("Downloaded {}".format(remote_path))
+    
+#     def get_file(remote_path:str):        
+#         object = StorageManager.get_local_copy(remote_path)
+#         return object
+
+#     def upload_file(local_path:str, remote_path:str):
+#         StorageManager.upload_file(local_path, remote_path, wait_for_upload=True, retries=3)
+
+# #Download Pretrained Models
+# bucket_ops.download_folder(
+#     local_path="/models/led-base-16384", 
+#     remote_path="s3://experiment-logging/pretrained/led-base-16384", 
+#     )
+
+# #Read args from config file instead, use vars() to convert namespace to dict
+dataset = Dataset.get(dataset_name="muc4-processed", dataset_project="datasets/muc4", dataset_tags=["processed", "GRIT"], only_published=True)
+dataset_folder = dataset.get_local_copy()
+#os.symlink(os.path.join(dataset_folder, "data/wikievents/muc_format"), args.data_dir)
+#print(list(os.walk(args.data_dir)))
+print(list(os.walk(os.path.join(dataset_folder, "data/muc4-grit/processed"))))
+
+def read_json(jsonfile):
+    with open(jsonfile, 'rb') as file:
+        file_object = [json.loads(sample) for sample in file]
+    return file_object
+
+
+train_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/train.json"))
+dev_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/dev.json"))
+test_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/test.json"))
+muc4 = {
+    "train": train_data,
+    "val": dev_data,
+    "test": test_data
+}
+
+
 import pytorch_lightning as pl
 import torch
+from torch import nn
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoConfig, AutoModelForSeq2SeqLM, set_seed, get_linear_schedule_with_warmup
 
-class bucket_ops:
-    StorageManager.set_cache_file_limit(5, cache_context=None)
+role_map = {
+    'PerpOrg': 'perpetrator organizations', 
+    'PerpInd': 'perpetrator individuals',
+    'Victim': 'victim',
+    'Target': 'target',
+    'Weapon': 'weapon'
+}
 
-    def list(remote_path:str):
-        return StorageManager.list(remote_path, return_full_path=False)
+#########################################################################################################################################
+def convert_templates_to_prompts(templates, tokenizer, prompt_embeds=True):
+    if prompt_embeds==True:
+        templates = [["{} {}".format(doc[key], tokenizer.sep_token) for key in doc.keys()] for doc in templates]
+    else:
+        templates = [["The entities that are {} are: {} {}".format(key, doc[key], tokenizer.sep_token) for key in doc.keys()] for doc in templates]
 
-    def upload_folder(local_path:str, remote_path:str):
-        StorageManager.upload_folder(local_path, remote_path, match_wildcard=None)
-        print("Uploaded {}".format(local_path))
-
-    def download_folder(local_path:str, remote_path:str):
-        StorageManager.download_folder(remote_path, local_path, match_wildcard=None, overwrite=True)
-        print("Downloaded {}".format(remote_path))
-    
-    def get_file(remote_path:str):        
-        object = StorageManager.get_local_copy(remote_path)
-        return object
-
-    def upload_file(local_path:str, remote_path:str):
-        StorageManager.upload_file(local_path, remote_path, wait_for_upload=True, retries=3)
-
+    template_strings = ["{}".format(' '.join(doc)) for doc in templates]
+    return template_strings
 
 class NERDataset(Dataset):
-    """HF arXiv Dataset Wrapper. It handles tokenization, max input/output seqlen, padding and batching"""
-
-    def __init__(self, dataset, tokenizer, args):
-        self.dataset = dataset
+    # doc_list
+    # extracted_list as template
+    def __init__(self, dataset, tokenizer):
         self.tokenizer = tokenizer
-        self.args = args
+        self.docs = [doc["doctext"] for doc in dataset]
+        # take only 1st mention of each role
+        first_mention_extracts = [{role_map[key].lower(): doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else 'none' for key in doc["extracts"].keys()} for doc in dataset]
+        # convert extracts to prompt template
+        self.train_templates = convert_templates_to_prompts(first_mention_extracts, tokenizer)
+        
+        #self.encodings = self.tokenizer(self.docs, padding=True, truncation=True, max_length=1024, return_tensors="pt")
+
+        max_length = 1024
+        input_ids = [self.tokenizer.encode(doc) for doc in self.docs]
+        input_ids = torch.stack([torch.tensor(tokens+(max_length-len(tokens))*[self.tokenizer.pad_token_id]) if len(tokens)<max_length else torch.tensor(tokens[:max_length]) for tokens in input_ids])
+
+        self.encodings = {
+            "input_ids": input_ids, 
+            "attention_mask": ~(input_ids == self.tokenizer.pad_token_id)
+        }
+        #import ipdb; ipdb.set_trace()
+        #self.labels = self.tokenizer(self.train_templates, padding=True, truncation=True, return_tensors="pt")["input_ids"][]
+        self.labels = [self.tokenizer.encode(template) for template in self.train_templates]
+        self.labels = torch.stack([torch.tensor(tokens+(max_length-len(tokens))*[self.tokenizer.pad_token_id]) if len(tokens)<max_length else torch.tensor(tokens[:max_length]) for tokens in self.labels])
+
 
     def __len__(self):
         """Returns length of the dataset"""
-        return len(self.dataset)
+        return len(self.docs)
 
     def __getitem__(self, idx):
         """Gets an example from the dataset. The input and output are tokenized and limited to a certain seqlen."""
-        entry = self.dataset[idx]
-        input_ids = self.tokenizer.encode(entry['article'], truncation=True, max_length=self.args.max_input_len,
-                                          padding='max_length')  # padding to max seqlen for const memory/example
-        output_ids = self.tokenizer.encode(entry['abstract'], truncation=True, max_length=self.args.max_output_len,
-                                           padding='max_length')  # padding to max seqlen for const memory/example
-        return torch.tensor(input_ids), torch.tensor(output_ids)
+        item = {key: val[idx] for key, val in self.encodings.items()}
+        item['labels'] = self.labels[idx]
+        item['decoder_mask'] = ~(self.labels[idx] == self.tokenizer.pad_token_id)
+        return item
 
     @staticmethod
     def collate_fn(batch):
@@ -72,12 +133,46 @@ class NERDataset(Dataset):
         Groups multiple examples into one batch with padding and tensorization.
         The collate function is called by PyTorch DataLoader
         """
-        pad_token_id = 1
-        input_ids, output_ids = list(zip(*batch))
-        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=pad_token_id)
-        output_ids = torch.nn.utils.rnn.pad_sequence(output_ids, batch_first=True, padding_value=pad_token_id)
-        return input_ids, output_ids
+        #pad_token_id = 1
+        #input_ids, output_ids = list(zip(*batch))
+        #input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=pad_token_id)
+        #output_ids = torch.nn.utils.rnn.pad_sequence(output_ids, batch_first=True, padding_value=pad_token_id)
 
+        input_ids = torch.stack([ex['input_ids'] for ex in batch]) 
+        attention_mask = torch.stack([ex['attention_mask'] for ex in batch]) 
+        labels = torch.stack([ex['labels'] for ex in batch]) 
+        decoder_mask = torch.stack([ex['decoder_mask'] for ex in batch]) 
+        
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'labels': labels,
+            'decoder_mask': decoder_mask 
+        }
+
+
+# tokenizer = AutoTokenizer.from_pretrained('allenai/led-base-16384', use_fast=True)
+# train_data = NERDataset(train_data, tokenizer)
+#import ipdb; ipdb.set_trace()
+
+
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        torch.nn.init.xavier_uniform(m.weight)
+        m.bias.data.fill_(0.01)
+
+def init_prompts(num_labels, prompt_length = 10, prompt_dim = 512):
+    prompt_list = []    
+    # Plus 1 for the prefix for the src tokens
+    for i in range(num_labels+1):
+        prompt = torch.rand(prompt_length, prompt_dim).cuda()
+        prompt.requires_grad = True
+        prompt_list.append(prompt)
+    return prompt_list # list of [(prompt_length x prompt_dim)]
+
+####################################################################################################################
+
+from transformers import LEDTokenizer, LEDForConditionalGeneration
 
 class NERLongformer(pl.LightningModule):
     """Pytorch Lightning module. It wraps up the model, data loading and training code"""
@@ -86,16 +181,26 @@ class NERLongformer(pl.LightningModule):
         """Loads the model, the tokenizer and the metric."""
         super().__init__()
         self.args = params
-
+        self.dataset = muc4
         # Load and update config then load a pretrained LEDForConditionalGeneration
-        config = AutoConfig.from_pretrained("/models/led-base-16384")
-        config.gradient_checkpointing = self.args.grad_ckpt
-        config.attention_window = [self.args.attention_window] * len(config.attention_window)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained("/models/led-base-16384", config=config)
+        self.config = AutoConfig.from_pretrained("allenai/led-base-16384")
+        self.config.gradient_checkpointing = True
+
+        self.model = LEDForConditionalGeneration.from_pretrained("allenai/led-base-16384")
+        #self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.wte = self.model.get_input_embeddings()
+
+        self.prompt_dim = 512
+        self.num_labels = 5
+        self.prompt_length=10
+
+        self.prompt_list = init_prompts(num_labels = self.num_labels, prompt_length=self.prompt_length, prompt_dim = self.prompt_dim)
+        # embedding_dim, model_dim, num_layers
+        self.promptMLP = nn.Sequential(nn.Linear(self.prompt_dim, 512), nn.Tanh(), nn.Linear(512, self.config.d_model))
+        self.promptMLP_decoder = nn.Sequential(nn.Linear(self.prompt_dim, 512), nn.Tanh(), nn.Linear(512, self.config.d_model))
 
         # Load tokenizer and metric
-        self.tokenizer = AutoTokenizer.from_pretrained('allenai/led-base-16384', use_fast=True)
-        self.rouge = datasets.load_metric('rouge')
+        self.tokenizer = LEDTokenizer.from_pretrained('allenai/led-base-16384', use_fast=True)
 
     def _set_global_attention_mask(self, input_ids):
         """Configure the global attention pattern based on the task"""
@@ -112,7 +217,7 @@ class NERLongformer(pl.LightningModule):
         # not a conceptual one (PyTorch 1.8.1).
         # The following line puts global attention on the <s> token to make sure all model
         # parameters which is necessery for gradient accumulation to work.
-        global_attention_mask[:, 0] = 1
+        global_attention_mask[:, :11] = 1
 
         # # Global attention on the first 100 tokens
         # global_attention_mask[:, :100] = 1
@@ -122,42 +227,84 @@ class NERLongformer(pl.LightningModule):
 
         return global_attention_mask
 
-    def forward(self, input_ids, output_ids):
+    def forward(self, **batch):
         """Call LEDForConditionalGeneration.forward"""
-        return self.model(input_ids,
-                          attention_mask=(input_ids != self.tokenizer.pad_token_id),  # mask padding tokens
-                          global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
-                          labels=output_ids, use_cache=False)
+        
+        input_ids, attention_mask, labels, decoder_mask = batch["input_ids"], batch["attention_mask"], batch["labels"], batch["decoder_mask"]
+        batch_size = input_ids.size()[0]
+
+        # Prepend a prompt prefix to encoder self.wte(input_ids) embeddings
+        input_ids = input_ids.type(torch.cuda.LongTensor)
+        batched_prompt = self.promptMLP(self.prompt_list[0]).unsqueeze(0).expand(batch_size, -1, -1).type(torch.cuda.FloatTensor)
+        embeds = self.wte(input_ids)
+        inputs_embeds = torch.cat([batched_prompt, embeds[:,:-self.prompt_length,:]], dim=1)
+
+        # Prepend a prompt prefix to decoder self.wte(input_ids) embeddings
+        labels = labels.type(torch.cuda.LongTensor)
+        batched_prompt_decoder = self.promptMLP_decoder(self.prompt_list[1]).unsqueeze(0).expand(batch_size, -1, -1).type(torch.cuda.FloatTensor)
+        labels_embeds = self.wte(labels)
+        decoder_inputs_embeds = torch.cat([batched_prompt_decoder, embeds[:,:-self.prompt_length,:]], dim=1)
+
+        outputs = self.model(inputs_embeds=inputs_embeds,
+                    decoder_inputs_embeds=decoder_inputs_embeds,
+                    #attention_mask=(input_ids != self.tokenizer.pad_token_id),  # mask padding tokens
+                    global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
+                    use_cache=False)
+
+        logits = outputs.logits
+        loss = None
+        outputs=(logits,)
+
+        prefix_mask = torch.tensor([10*[False]]).repeat(batch_size, 1).to(self.device)
+        decoder_mask = torch.cat([prefix_mask, decoder_mask[:, :-10]], dim=1)
+
+        if labels!=None:
+            loss_fct = nn.CrossEntropyLoss()
+            # Only keep active parts of the loss
+            active_loss = decoder_mask.view(-1) == 1 # Convert to a single dimension where True if equals 1 and 0 if not
+            active_logits = logits.view(-1, self.config.vocab_size) # Collapse batch to single dimension 
+            active_labels = torch.where(
+                active_loss, labels.view(-1), torch.tensor(loss_fct.ignore_index).type_as(labels)
+            ) # if is in active loss, collapse batch of labels to single dimension else replace with the ignore ignore index from loss function
+            
+            loss = loss_fct(active_logits, active_labels)
+            outputs = (loss,) + (logits,)
+
+        return outputs
+
+
 
     def training_step(self, batch, batch_nb):
         """Call the forward pass then return loss"""
-        outputs = self.forward(*batch)
-        return {'loss': outputs.loss}
+        outputs = self.forward(**batch)
+        return {'loss': outputs[0]}
 
     def configure_optimizers(self):
         """Configure the optimizer and the learning rate scheduler"""
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr)
-        dataset_size = len(self.hf_dataset['train'])
-        gpu_count = torch.cuda.device_count()
-        num_steps = dataset_size * self.args.epochs / gpu_count / self.args.grad_accum / self.args.batch_size
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=self.args.warmup,
-                                                    num_training_steps=num_steps)
-        return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
+        # Freeze the model
+        for idx, (name, parameters) in enumerate(self.model.named_parameters()):
+            parameters.requires_grad=False
+
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
+        # dataset_size = len(self.dataset['train'])
+        # gpu_count = torch.cuda.device_count()
+        # num_steps = dataset_size * self.args.epochs / gpu_count / self.args.grad_accum / self.args.batch_size
+        # scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=self.args.warmup,
+        #                                             num_training_steps=num_steps)
+
+        return [optimizer]#, [{"scheduler": scheduler, "interval": "step"}]
 
     def _get_dataloader(self, split_name, is_train):
         """Get training and validation dataloaders"""
-        dataset_split = self.hf_dataset[split_name]
-        dataset = NERDataset(hf_arxiv_dataset=dataset_split, tokenizer=self.tokenizer, args=self.args)
-        sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=is_train)
-        return DataLoader(dataset, batch_size=self.args.batch_size, shuffle=(sampler is None),
-                          num_workers=self.args.num_workers, sampler=sampler,
-                          collate_fn=NERDataset.collate_fn)
+        dataset_split = self.dataset[split_name]
+        dataset = NERDataset(dataset=dataset_split, tokenizer=self.tokenizer)
+        return DataLoader(dataset, batch_size=self.args.batch_size, num_workers=self.args.num_workers, collate_fn=NERDataset.collate_fn)
 
     def train_dataloader(self):
         return self._get_dataloader('train', is_train=True)
 
     def val_dataloader(self):
-        return self._get_dataloader('validation', is_train=False)
+        return self._get_dataloader('val', is_train=False)
 
     def test_dataloader(self):
         return self._get_dataloader('test', is_train=False)
@@ -165,22 +312,24 @@ class NERLongformer(pl.LightningModule):
     def _evaluation_step(self, split, batch, batch_nb):
         """Validaton or Testing - predict output, compare it with gold, compute rouge1, 2, L, and log result"""
         # Generate
-        input_ids, output_ids = batch
-        generated_ids = self.model.generate(input_ids=input_ids,
+        input_ids, attention_mask, labels = batch["input_ids"], batch["attention_mask"], batch["labels"]
+        generated_ids = self(input_ids=input_ids,
                                             attention_mask=(input_ids != self.tokenizer.pad_token_id),
                                             global_attention_mask=self._set_global_attention_mask(input_ids),
                                             use_cache=True, max_length=self.args.max_output_len, num_beams=1)
 
         # Convert predicted and gold token ids to strings
         predictions = self.tokenizer.batch_decode(generated_ids.tolist(), skip_special_tokens=True)
-        references = self.tokenizer.batch_decode(output_ids.tolist(), skip_special_tokens=True)
+        references = self.tokenizer.batch_decode(labels.tolist(), skip_special_tokens=True)
+
+        # Probably need to change this
 
         # Compute rouge
-        metric_names = ['rouge1', 'rouge2', 'rougeL', 'rougeLsum']
-        results = self.rouge.compute(predictions=predictions, references=references)
-        for metric_name in metric_names:
-            metric_val = input_ids.new_zeros(1) + results[metric_name].mid.fmeasure
-            self.log(f'{split}_{metric_name}', metric_val, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
+        # metric_names = ['rouge1', 'rouge2', 'rougeL', 'rougeLsum']
+        # results = self.rouge.compute(predictions=predictions, references=references)
+        # for metric_name in metric_names:
+        #     metric_val = input_ids.new_zeros(1) + results[metric_name].mid.fmeasure
+        #     self.log(f'{split}_{metric_name}', metric_val, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
 
     def validation_step(self, batch, batch_nb):
         self._evaluation_step('val', batch, batch_nb)
@@ -210,71 +359,62 @@ class NERLongformer(pl.LightningModule):
         parser.add_argument("--fp16", action='store_true', help="Use fp16 ")
         parser.add_argument('--grad_ckpt', action='store_true', help='Enable gradient checkpointing to save memory')
         parser.add_argument("--attention_window", type=int, default=1024, help="Attention window")
-
         return parser
 
+# checkpoint_callback = pl.callbacks.ModelCheckpoint(
+#     dirpath = "./",
+#     filename="best_entity_lm", 
+#     monitor="val_perplexity", 
+#     mode="min", 
+#     save_top_k=1, 
+#     save_weights_only=True
+# )
 
-if __name__ == "__main__":
-    # Setup command line args
-    # main_arg_parser = argparse.ArgumentParser(description="summarization")
-    # parser = NERLongformer.add_model_specific_args(main_arg_parser)
-    # args = parser.parse_args()
 
-    #Download Pretrained Models
-    bucket_ops.download_folder(
-        local_path="/models/led-base-16384", 
-        remote_path="s3://experiment-logging/pretrained/led-base-16384", 
-        )
+NER = NERLongformer(args)
+trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs)
+trainer.fit(NER)
 
-    #Read args from config file instead, use vars() to convert namespace to dict
-    dataset = Dataset.get(dataset_name="muc4-processed", dataset_project="datasets/muc4", dataset_tags=["processed"], only_published=True)
-    dataset_folder = dataset.get_local_copy()
-    # if os.path.exists(dataset_folder)==False:
-    os.symlink(os.path.join(dataset_folder, "data/wikievents/muc_format"), args.data_dir)
-    print(args)
-    print(list(os.walk(args.data_dir)))
 
-    # Init a PL module
-    set_seed(args.seed)    
-    NER = NERLongformer(args)
+#########################################################################################################################
 
-    # Load the arXiv dataset from HF datasets
-    # NER.dataset = datasets.load_dataset('scientific_papers', 'arxiv')
 
-    # checkpoint_callback = ModelCheckpoint(monitor='val_acc',
-    #                                       mode="max",
-    #                                       dirpath=args.output_dir,
-    #                                       save_top_k=3)
 
-    #if not os.path.exists(args.output_dir):
-    #    os.makedirs(args.output_dir)
+# Load the arXiv dataset from HF datasets
+# checkpoint_callback = ModelCheckpoint(monitor='val_acc',
+#                                       mode="max",
+#                                       dirpath=args.output_dir,
+#                                       save_top_k=3)
 
-    # Construct a PL trainer
-    # trainer = pl.Trainer(gpus=-1,
-    #                      # accelerator='ddp',
-    #                      # Gradient Accumulation caveat 2:
-    #                      # For gradient accumulation to work with DistributedDataParallel,
-    #                      # the `find_unused_parameters` should be `False`. Without it,
-    #                      # you get a not-very-helpful error message (PyTorch 1.8.1)
-    #                      #plugins=[pl.plugins.ddp_plugin.DDPPlugin(find_unused_parameters=False)],
-    #                      max_epochs=args.epochs,
-    #                      #replace_sampler_ddp=False,
-    #                      num_sanity_val_steps=0,
-    #                      default_root_dir=args.output_dir,
-    #                      #limit_val_batches=args.limit_val_batches,
-    #                      #limit_train_batches=args.limit_train_batches,
-    #                      #limit_test_batches=args.limit_test_batches,
-    #                      precision=16 if args.fp16 else 32,
-    #                      accumulate_grad_batches=args.grad_accum,
-    #                      callbacks=[checkpoint_callback],
-    #                      val_check_interval=args.val_every
-    #                      )
-    # Start training
-    #trainer.fit(NER)
+#if not os.path.exists(args.output_dir):
+#    os.makedirs(args.output_dir)
 
-    # Start testing
-    #result = trainer.test()
-    #print(result)
+# Construct a PL trainer
+# trainer = pl.Trainer(gpus=-1,
+#                      # accelerator='ddp',
+#                      # Gradient Accumulation caveat 2:
+#                      # For gradient accumulation to work with DistributedDataParallel,
+#                      # the `find_unused_parameters` should be `False`. Without it,
+#                      # you get a not-very-helpful error message (PyTorch 1.8.1)
+#                      #plugins=[pl.plugins.ddp_plugin.DDPPlugin(find_unused_parameters=False)],
+#                      max_epochs=args.epochs,
+#                      #replace_sampler_ddp=False,
+#                      num_sanity_val_steps=0,
+#                      default_root_dir=args.output_dir,
+#                      #limit_val_batches=args.limit_val_batches,
+#                      #limit_train_batches=args.limit_train_batches,
+#                      #limit_test_batches=args.limit_test_batches,
+#                      precision=16 if args.fp16 else 32,
+#                      accumulate_grad_batches=args.grad_accum,
+#                      callbacks=[checkpoint_callback],
+#                      val_check_interval=args.val_every
+#                      )
+# Start training
+#trainer.fit(NER)
+
+# Start testing
+#result = trainer.test()
+#print(result)
 
 
 '''
