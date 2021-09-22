@@ -3,7 +3,7 @@ import argparse
 import json, os
 
 #Task.add_requirements('transformers', package_version='4.2.0')
-task = Task.init(project_name='LangGen', task_name='promptNER-5-classes', output_uri="s3://experiment-logging/storage/")
+task = Task.init(project_name='LangGen', task_name='promptNER-fixedwords', output_uri="s3://experiment-logging/storage/")
 task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
 
 config = json.load(open('config.json'))
@@ -80,14 +80,9 @@ role_map = {
 }
 
 #########################################################################################################################################
-def convert_templates_to_prompts(templates, tokenizer, prompt_embeds=True):
-    if prompt_embeds==True:
-        templates = [["{} {}".format(doc[key], tokenizer.sep_token) for key in doc.keys()] for doc in templates]
-        #templates = [["{} {}".format(doc[list(doc.keys())[0]], tokenizer.sep_token)] for doc in templates]
-    else:
-        templates = [["The entities that are {} are: {} {}".format(key, doc[key], tokenizer.sep_token) for key in doc.keys()] for doc in templates]
-
-    template_strings = [' '.join(doc) for doc in templates]
+def convert_templates_to_prompts(templates, tokenizer):
+    templates = [["The entities that are {} are: {} {}".format(key, doc[key], tokenizer.sep_token) for key in doc.keys()] for doc in templates]
+    template_strings = ["{}".format(' '.join(doc)) for doc in templates]
     return template_strings
 
 class NERDataset(Dataset):
@@ -104,7 +99,6 @@ class NERDataset(Dataset):
         #self.encodings = self.tokenizer(self.docs, padding=True, truncation=True, max_length=1024, return_tensors="pt")
 
         max_length = 1024
-        tgt_max_length = 512
         input_ids = [self.tokenizer.encode(doc) for doc in self.docs]
         input_ids = torch.stack([torch.tensor(tokens+(max_length-len(tokens))*[self.tokenizer.pad_token_id]) if len(tokens)<max_length else torch.tensor(tokens[:max_length]) for tokens in input_ids])
 
@@ -115,7 +109,8 @@ class NERDataset(Dataset):
         #import ipdb; ipdb.set_trace()
         #self.labels = self.tokenizer(self.train_templates, padding=True, truncation=True, return_tensors="pt")["input_ids"][]
         self.labels = [self.tokenizer.encode(template) for template in self.train_templates]
-        self.labels = torch.stack([torch.tensor(tokens+(tgt_max_length-len(tokens))*[self.tokenizer.pad_token_id]) if len(tokens)<tgt_max_length else torch.tensor(tokens[:tgt_max_length]) for tokens in self.labels])
+        self.labels = torch.stack([torch.tensor(tokens+(max_length-len(tokens))*[self.tokenizer.pad_token_id]) if len(tokens)<max_length else torch.tensor(tokens[:max_length]) for tokens in self.labels])
+
 
     def __len__(self):
         """Returns length of the dataset"""
@@ -192,17 +187,6 @@ class NERLongformer(pl.LightningModule):
         self.config = AutoConfig.from_pretrained("allenai/led-base-16384")
         self.config.gradient_checkpointing = True
         self.model = LEDForConditionalGeneration.from_pretrained("allenai/led-base-16384")
-        self.wte = self.model.get_input_embeddings()
-
-        self.prompt_dim = 768 #512
-        self.num_labels = 1
-        self.prompt_length=10
-
-        # Create MLPs to reparameterize the prompts
-        self.prompt_list = prompt_list if prompt_list !=None else init_prompts(num_labels = self.num_labels, prompt_length=self.prompt_length, prompt_dim = self.prompt_dim)
-        
-        #self.promptMLP = nn.Sequential(nn.Linear(self.prompt_dim, 512), nn.Tanh(), nn.Linear(512, self.config.d_model))
-        #self.promptMLP_decoder = nn.Sequential(nn.Linear(self.prompt_dim, 512), nn.Tanh(), nn.Linear(512, self.config.d_model))
 
         # Load tokenizer and metric
         self.tokenizer = LEDTokenizer.from_pretrained('allenai/led-base-16384', use_fast=True)
@@ -222,7 +206,7 @@ class NERLongformer(pl.LightningModule):
         # not a conceptual one (PyTorch 1.8.1).
         # The following line puts global attention on the <s> token to make sure all model
         # parameters which is necessery for gradient accumulation to work.
-        global_attention_mask[:, :11] = 1
+        global_attention_mask[:, :1] = 1
 
         # # Global attention on the first 100 tokens
         # global_attention_mask[:, :100] = 1
@@ -238,32 +222,15 @@ class NERLongformer(pl.LightningModule):
         input_ids, attention_mask, decoder_input_ids, decoder_mask  = batch["input_ids"], batch["attention_mask"], batch["decoder_input_ids"], batch["decoder_mask"]
         batch_size = input_ids.size()[0]
 
-        # Prepend a prompt prefix to encoder self.wte(input_ids) embeddings
-        input_ids = input_ids.type(torch.cuda.LongTensor)
-        batched_prompt = self.prompt_list[0].unsqueeze(0).expand(batch_size, -1, -1) #self.promptMLP(self.prompt_list[0]).unsqueeze(0).expand(batch_size, -1, -1).type(torch.cuda.FloatTensor)
-        embeds = self.wte(input_ids)
-        inputs_embeds = torch.cat([batched_prompt, embeds[:,:-self.prompt_length,:]], dim=1)
-
-        batched_prompt_mask = torch.ones(batched_prompt.size()[:2], device=self.device)
-        attention_mask = torch.cat([batched_prompt_mask, attention_mask[:,:-self.prompt_length]], dim=1)
-
-        # Prepend a prompt prefix to decoder self.wte(input_ids) embeddings
-        decoder_input_ids = decoder_input_ids.type(torch.cuda.LongTensor)
-        batched_prompt_decoder = self.prompt_list[1].unsqueeze(0).expand(batch_size, -1, -1) #self.promptMLP_decoder(self.prompt_list[1]).unsqueeze(0).expand(batch_size, -1, -1).type(torch.cuda.FloatTensor)
-        labels_embeds = self.wte(decoder_input_ids)
-        decoder_inputs_embeds = torch.cat([batched_prompt_decoder, labels_embeds[:,:-self.prompt_length,:]], dim=1)
-
         # Pass both the prompt-prepended input_embeds and decoder_input_embeds to the transformer model
-        outputs = self.model(inputs_embeds=inputs_embeds,
-                    decoder_inputs_embeds=decoder_inputs_embeds,
+        outputs = self.model(inputs_ids=input_ids,
+                    decoder_inputs_ids=decoder_input_ids,
                     attention_mask=attention_mask,  # mask padding tokens
                     global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
                     use_cache=False)
 
         logits = outputs.logits
         # Get mask to prevent loss calculation of mask positions during backprop
-        prefix_mask = torch.tensor([10*[False]]).repeat(batch_size, 1).to(self.device)
-        decoder_mask = torch.cat([prefix_mask, decoder_mask[:, :-10]], dim=1)
 
         if "labels" in batch.keys():
             labels = batch["labels"]
@@ -384,57 +351,3 @@ NER = NERLongformer(args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs)
 trainer.fit(NER)
 
-
-#########################################################################################################################
-
-
-
-# Load the arXiv dataset from HF datasets
-# checkpoint_callback = ModelCheckpoint(monitor='val_acc',
-#                                       mode="max",
-#                                       dirpath=args.output_dir,
-#                                       save_top_k=3)
-
-#if not os.path.exists(args.output_dir):
-#    os.makedirs(args.output_dir)
-
-# Construct a PL trainer
-# trainer = pl.Trainer(gpus=-1,
-#                      # accelerator='ddp',
-#                      # Gradient Accumulation caveat 2:
-#                      # For gradient accumulation to work with DistributedDataParallel,
-#                      # the `find_unused_parameters` should be `False`. Without it,
-#                      # you get a not-very-helpful error message (PyTorch 1.8.1)
-#                      #plugins=[pl.plugins.ddp_plugin.DDPPlugin(find_unused_parameters=False)],
-#                      max_epochs=args.epochs,
-#                      #replace_sampler_ddp=False,
-#                      num_sanity_val_steps=0,
-#                      default_root_dir=args.output_dir,
-#                      #limit_val_batches=args.limit_val_batches,
-#                      #limit_train_batches=args.limit_train_batches,
-#                      #limit_test_batches=args.limit_test_batches,
-#                      precision=16 if args.fp16 else 32,
-#                      accumulate_grad_batches=args.grad_accum,
-#                      callbacks=[checkpoint_callback],
-#                      val_check_interval=args.val_every
-#                      )
-# Start training
-#trainer.fit(NER)
-
-# Start testing
-#result = trainer.test()
-#print(result)
-
-
-'''
-conda create --name tutorial python=3.7
-conda activate tutorial
-
-conda install pytorch torchvision torchaudio cudatoolkit=10.2 -c pytorch
-git clone git@github.com:allenai/naacl2021-longdoc-tutorial.git
-cd naacl2021-longdoc-tutorial
-pip install -r requirements.txt
-PYTHONWARNINGS="ignore" CUDA_VISIBLE_DEVICES=6,7   python summarization.py  \
-    --fp16  --batch_size 2  --grad_accum 1 --grad_ckpt   \
-    --max_input_len  16384 --attention_window  1024
-'''
