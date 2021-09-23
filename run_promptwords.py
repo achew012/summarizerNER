@@ -3,37 +3,37 @@ import argparse
 import json, os
 
 #Task.add_requirements('transformers', package_version='4.2.0')
-task = Task.init(project_name='LangGen', task_name='promptNER-fixedwords', output_uri="s3://experiment-logging/storage/")
-task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+task = Task.init(project_name='LangGen', task_name='promptNER-fixedwords-Seq2Seq', output_uri="s3://experiment-logging/storage/")
+clearlogger = task.get_logger()
 
 config = json.load(open('config.json'))
 args = argparse.Namespace(**config)
+
+task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
 task.connect(args)
-
 task.execute_remotely(queue_name="128RAMv100", exit_process=True)
-clearlogger = task.get_logger()
 
 
-# class bucket_ops:
-#     StorageManager.set_cache_file_limit(5, cache_context=None)
+class bucket_ops:
+    StorageManager.set_cache_file_limit(5, cache_context=None)
 
-#     def list(remote_path:str):
-#         return StorageManager.list(remote_path, return_full_path=False)
+    def list(remote_path:str):
+        return StorageManager.list(remote_path, return_full_path=False)
 
-#     def upload_folder(local_path:str, remote_path:str):
-#         StorageManager.upload_folder(local_path, remote_path, match_wildcard=None)
-#         print("Uploaded {}".format(local_path))
+    def upload_folder(local_path:str, remote_path:str):
+        StorageManager.upload_folder(local_path, remote_path, match_wildcard=None)
+        print("Uploaded {}".format(local_path))
 
-#     def download_folder(local_path:str, remote_path:str):
-#         StorageManager.download_folder(remote_path, local_path, match_wildcard=None, overwrite=True)
-#         print("Downloaded {}".format(remote_path))
+    def download_folder(local_path:str, remote_path:str):
+        StorageManager.download_folder(remote_path, local_path, match_wildcard=None, overwrite=True)
+        print("Downloaded {}".format(remote_path))
     
-#     def get_file(remote_path:str):        
-#         object = StorageManager.get_local_copy(remote_path)
-#         return object
+    def get_file(remote_path:str):        
+        object = StorageManager.get_local_copy(remote_path)
+        return object
 
-#     def upload_file(local_path:str, remote_path:str):
-#         StorageManager.upload_file(local_path, remote_path, wait_for_upload=True, retries=3)
+    def upload_file(local_path:str, remote_path:str):
+        StorageManager.upload_file(local_path, remote_path, wait_for_upload=True, retries=3)
 
 # #Download Pretrained Models
 # bucket_ops.download_folder(
@@ -53,7 +53,6 @@ def read_json(jsonfile):
         file_object = [json.loads(sample) for sample in file]
     return file_object
 
-
 train_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/train.json"))
 dev_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/dev.json"))
 test_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/test.json"))
@@ -70,6 +69,7 @@ from torch import nn
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoConfig, AutoModelForSeq2SeqLM, set_seed, get_linear_schedule_with_warmup
+from seqeval.metrics import f1_score, precision_score, recall_score, accuracy_score
 
 role_map = {
     'PerpOrg': 'perpetrator organizations', 
@@ -155,23 +155,7 @@ class NERDataset(Dataset):
 #import ipdb; ipdb.set_trace()
 
 
-def init_weights(m):
-    if isinstance(m, nn.Linear):
-        torch.nn.init.xavier_uniform(m.weight)
-        m.bias.data.fill_(0.01)
-
-### Returns list  of random init tensors size (prompt len x prompt dim) 
-def init_prompts(num_labels, prompt_length = 10, prompt_dim = 512):
-    prompt_list = []    
-    # Plus 1 for the prefix for the src tokens
-    for i in range(num_labels+1):
-        prompt = torch.rand(prompt_length, prompt_dim).cuda()
-        prompt.requires_grad = True
-        prompt_list.append(prompt)
-    return prompt_list # list of [(prompt_length x prompt_dim)]
-
 ####################################################################################################################
-
 from transformers import LEDTokenizer, LEDForConditionalGeneration
 
 class NERLongformer(pl.LightningModule):
@@ -180,13 +164,15 @@ class NERLongformer(pl.LightningModule):
     def __init__(self, params, prompt_list=None):
         """Loads the model, the tokenizer and the metric."""
         super().__init__()
+        self.save_hyperparameters()
         self.args = params
         self.dataset = muc4
 
         # Load and update config then load a pretrained LEDForConditionalGeneration
         self.config = AutoConfig.from_pretrained("allenai/led-base-16384")
-        self.config.gradient_checkpointing = True
-        self.model = LEDForConditionalGeneration.from_pretrained("allenai/led-base-16384")
+        self.config.gradient_checkpointing = True        
+        #self.model = LEDForConditionalGeneration.from_pretrained("allenai/led-base-16384")
+        self.model = AutoModelForSeq2SeqLM.from_pretrained("allenai/led-base-16384")
 
         # Load tokenizer and metric
         self.tokenizer = LEDTokenizer.from_pretrained('allenai/led-base-16384', use_fast=True)
@@ -223,8 +209,8 @@ class NERLongformer(pl.LightningModule):
         batch_size = input_ids.size()[0]
 
         # Pass both the prompt-prepended input_embeds and decoder_input_embeds to the transformer model
-        outputs = self.model(inputs_ids=input_ids,
-                    decoder_inputs_ids=decoder_input_ids,
+        outputs = self.model(input_ids=input_ids,
+                    decoder_input_ids=decoder_input_ids,
                     attention_mask=attention_mask,  # mask padding tokens
                     global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
                     use_cache=False)
@@ -259,12 +245,15 @@ class NERLongformer(pl.LightningModule):
         """Configure the optimizer and the learning rate scheduler"""
         # Freeze the model
         for idx, (name, parameters) in enumerate(self.model.named_parameters()):
-            parameters.requires_grad=False
+            if idx>6:
+                parameters.requires_grad=True
+            else:
+                parameters.requires_grad=False
 
         optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
         dataset_size = len(self.dataset['train'])
         gpu_count = torch.cuda.device_count()
-        num_steps = dataset_size * self.args.epochs / gpu_count / self.args.grad_accum / self.args.batch_size
+        num_steps = dataset_size * self.args.num_epochs / gpu_count / self.args.grad_accum / self.args.batch_size
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=self.args.warmup,
                                                     num_training_steps=num_steps)
         return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
@@ -287,25 +276,29 @@ class NERLongformer(pl.LightningModule):
     def _evaluation_step(self, split, batch, batch_nb):
         """Validaton or Testing - predict output, compare it with gold, compute rouge1, 2, L, and log result"""
         labels = batch.pop("labels", None)
-        #self.prompt_list
+
         outputs = self(**batch)
         logits = nn.Softmax(dim=-1)(outputs[0])
         logits = torch.argmax(logits, dim=-1)
         predictions = torch.masked_select(logits, batch["decoder_mask"])
-    
+
         # Convert predicted and gold token ids to strings
         predictions = self.tokenizer.batch_decode(predictions.tolist(), skip_special_tokens=True)
         gold = self.tokenizer.batch_decode(labels.tolist(), skip_special_tokens=True)
 
         # Probably need to change this
         print(predictions)
+        print("gold: {}".format(gold))
 
-        # Compute rouge
-        # metric_names = ['rouge1', 'rouge2', 'rougeL', 'rougeLsum']
-        # results = self.rouge.compute(predictions=predictions, references=references)
-        # for metric_name in metric_names:
-        #     metric_val = input_ids.new_zeros(1) + results[metric_name].mid.fmeasure
-        #     self.log(f'{split}_{metric_name}', metric_val, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
+
+        acc = accuracy_score(predictions, gold)
+
+        logs = {
+            "val_accuracy": acc
+        }
+
+        self.log("val_accuracy", logs["val_accuracy"])
+
 
     def validation_step(self, batch, batch_nb):
         self._evaluation_step('val', batch, batch_nb)
@@ -319,7 +312,6 @@ class NERLongformer(pl.LightningModule):
         parser.add_argument("--seed", type=int, default=1234, help="Seed")
         parser.add_argument("--lr", type=float, default=0.00003, help="Maximum learning rate")
         parser.add_argument("--warmup", type=int, default=1000, help="Number of warmup steps")
-        parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
         parser.add_argument("--num_workers", type=int, default=4, help="Number of data loader workers")
         parser.add_argument("--limit_val_batches", default=0.005, type=float, help='Percent of validation data used')
         parser.add_argument("--limit_test_batches", default=0.005, type=float, help='Percent of test data used')
@@ -337,17 +329,23 @@ class NERLongformer(pl.LightningModule):
         parser.add_argument("--attention_window", type=int, default=1024, help="Attention window")
         return parser
 
-# checkpoint_callback = pl.callbacks.ModelCheckpoint(
-#     dirpath = "./",
-#     filename="best_entity_lm", 
-#     monitor="val_perplexity", 
-#     mode="min", 
-#     save_top_k=1, 
-#     save_weights_only=True
-# )
-
+checkpoint_callback = pl.callbacks.ModelCheckpoint(
+    dirpath = "./",
+    filename="best_ner_model", 
+    monitor="val_accuracy", 
+    mode="max", 
+    save_top_k=1, 
+    save_weights_only=True
+)
 
 NER = NERLongformer(args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs)
 trainer.fit(NER)
+
+# trained_model_path = bucket_ops.get_file(
+#     remote_path="s3://experiment-logging/storage/LangGen/promptNER-fixedwords.54168c64dada47b1a6033865a9b7e705/models/epoch=9-step=1999.ckpt"
+#     )
+#model = NER.load_from_checkpoint(trained_model_path, params = args)
+#results = trainer.test(model)
+#print(results)
 

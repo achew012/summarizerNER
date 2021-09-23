@@ -3,15 +3,16 @@ import argparse
 import json, os
 
 #Task.add_requirements('transformers', package_version='4.2.0')
-task = Task.init(project_name='LangGen', task_name='promptNER-5-classes', output_uri="s3://experiment-logging/storage/")
-task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+task = Task.init(project_name='LangGen', task_name='promptNER', output_uri="s3://experiment-logging/storage/")
+clearlogger = task.get_logger()
 
 config = json.load(open('config.json'))
 args = argparse.Namespace(**config)
-task.connect(args)
 
-task.execute_remotely(queue_name="128RAMv100", exit_process=True)
-clearlogger = task.get_logger()
+#task.connect(args)
+#task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+#task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+
 
 
 # class bucket_ops:
@@ -70,6 +71,7 @@ from torch import nn
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoConfig, AutoModelForSeq2SeqLM, set_seed, get_linear_schedule_with_warmup
+#from transformers import LEDTokenizer, LEDForConditionalGeneration
 
 role_map = {
     'PerpOrg': 'perpetrator organizations', 
@@ -82,7 +84,9 @@ role_map = {
 #########################################################################################################################################
 def convert_templates_to_prompts(templates, tokenizer, prompt_embeds=True):
     if prompt_embeds==True:
+        # All classes
         templates = [["{} {}".format(doc[key], tokenizer.sep_token) for key in doc.keys()] for doc in templates]
+        # 1st class
         #templates = [["{} {}".format(doc[list(doc.keys())[0]], tokenizer.sep_token)] for doc in templates]
     else:
         templates = [["The entities that are {} are: {} {}".format(key, doc[key], tokenizer.sep_token) for key in doc.keys()] for doc in templates]
@@ -102,7 +106,6 @@ class NERDataset(Dataset):
         self.train_templates = convert_templates_to_prompts(first_mention_extracts, tokenizer)
         
         #self.encodings = self.tokenizer(self.docs, padding=True, truncation=True, max_length=1024, return_tensors="pt")
-
         max_length = 1024
         tgt_max_length = 512
         input_ids = [self.tokenizer.encode(doc) for doc in self.docs]
@@ -159,7 +162,6 @@ class NERDataset(Dataset):
 # train_data = NERDataset(train_data, tokenizer)
 #import ipdb; ipdb.set_trace()
 
-
 def init_weights(m):
     if isinstance(m, nn.Linear):
         torch.nn.init.xavier_uniform(m.weight)
@@ -177,8 +179,6 @@ def init_prompts(num_labels, prompt_length = 10, prompt_dim = 512):
 
 ####################################################################################################################
 
-from transformers import LEDTokenizer, LEDForConditionalGeneration
-
 class NERLongformer(pl.LightningModule):
     """Pytorch Lightning module. It wraps up the model, data loading and training code"""
 
@@ -188,24 +188,28 @@ class NERLongformer(pl.LightningModule):
         self.args = params
         self.dataset = muc4
 
+        self.tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+        # self.tokenizer = LEDTokenizer.from_pretrained(args.model, use_fast=True)
+
         # Load and update config then load a pretrained LEDForConditionalGeneration
-        self.config = AutoConfig.from_pretrained("allenai/led-base-16384")
+        self.config = AutoConfig.from_pretrained(args.model)
         self.config.gradient_checkpointing = True
-        self.model = LEDForConditionalGeneration.from_pretrained("allenai/led-base-16384")
+        self.model = LEDForConditionalGeneration.from_pretrained(args.model)
+        # self.config = AutoConfig.from_pretrained(args.model)
+        # self.model = AutoModelForSeq2SeqLM.from_pretrained(args.model)
+
         self.wte = self.model.get_input_embeddings()
 
-        self.prompt_dim = 768 #512
+        self.prompt_dim = 512
         self.num_labels = 1
         self.prompt_length=10
 
         # Create MLPs to reparameterize the prompts
         self.prompt_list = prompt_list if prompt_list !=None else init_prompts(num_labels = self.num_labels, prompt_length=self.prompt_length, prompt_dim = self.prompt_dim)
         
-        #self.promptMLP = nn.Sequential(nn.Linear(self.prompt_dim, 512), nn.Tanh(), nn.Linear(512, self.config.d_model))
-        #self.promptMLP_decoder = nn.Sequential(nn.Linear(self.prompt_dim, 512), nn.Tanh(), nn.Linear(512, self.config.d_model))
+        self.promptMLP = nn.Sequential(nn.Linear(self.prompt_dim, 512), nn.Tanh(), nn.Linear(512, self.config.d_model))
+        # self.promptMLP_decoder = nn.Sequential(nn.Linear(self.prompt_dim, 512), nn.Tanh(), nn.Linear(512, self.config.d_model))
 
-        # Load tokenizer and metric
-        self.tokenizer = LEDTokenizer.from_pretrained('allenai/led-base-16384', use_fast=True)
 
     def _set_global_attention_mask(self, input_ids):
         """Configure the global attention pattern based on the task"""
@@ -240,7 +244,7 @@ class NERLongformer(pl.LightningModule):
 
         # Prepend a prompt prefix to encoder self.wte(input_ids) embeddings
         input_ids = input_ids.type(torch.cuda.LongTensor)
-        batched_prompt = self.prompt_list[0].unsqueeze(0).expand(batch_size, -1, -1) #self.promptMLP(self.prompt_list[0]).unsqueeze(0).expand(batch_size, -1, -1).type(torch.cuda.FloatTensor)
+        batched_prompt = self.promptMLP(self.prompt_list[0]).unsqueeze(0).expand(batch_size, -1, -1).type(torch.cuda.FloatTensor)
         embeds = self.wte(input_ids)
         inputs_embeds = torch.cat([batched_prompt, embeds[:,:-self.prompt_length,:]], dim=1)
 
@@ -249,7 +253,7 @@ class NERLongformer(pl.LightningModule):
 
         # Prepend a prompt prefix to decoder self.wte(input_ids) embeddings
         decoder_input_ids = decoder_input_ids.type(torch.cuda.LongTensor)
-        batched_prompt_decoder = self.prompt_list[1].unsqueeze(0).expand(batch_size, -1, -1) #self.promptMLP_decoder(self.prompt_list[1]).unsqueeze(0).expand(batch_size, -1, -1).type(torch.cuda.FloatTensor)
+        batched_prompt_decoder = self.promptMLP(self.prompt_list[1]).unsqueeze(0).expand(batch_size, -1, -1).type(torch.cuda.FloatTensor)
         labels_embeds = self.wte(decoder_input_ids)
         decoder_inputs_embeds = torch.cat([batched_prompt_decoder, labels_embeds[:,:-self.prompt_length,:]], dim=1)
 
@@ -257,7 +261,7 @@ class NERLongformer(pl.LightningModule):
         outputs = self.model(inputs_embeds=inputs_embeds,
                     decoder_inputs_embeds=decoder_inputs_embeds,
                     attention_mask=attention_mask,  # mask padding tokens
-                    global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
+                    #global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
                     use_cache=False)
 
         logits = outputs.logits
@@ -297,7 +301,7 @@ class NERLongformer(pl.LightningModule):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
         dataset_size = len(self.dataset['train'])
         gpu_count = torch.cuda.device_count()
-        num_steps = dataset_size * self.args.epochs / gpu_count / self.args.grad_accum / self.args.batch_size
+        num_steps = dataset_size * self.args.num_epochs / gpu_count / self.args.grad_accum / self.args.batch_size
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=self.args.warmup,
                                                     num_training_steps=num_steps)
         return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
@@ -352,7 +356,6 @@ class NERLongformer(pl.LightningModule):
         parser.add_argument("--seed", type=int, default=1234, help="Seed")
         parser.add_argument("--lr", type=float, default=0.00003, help="Maximum learning rate")
         parser.add_argument("--warmup", type=int, default=1000, help="Number of warmup steps")
-        parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
         parser.add_argument("--num_workers", type=int, default=4, help="Number of data loader workers")
         parser.add_argument("--limit_val_batches", default=0.005, type=float, help='Percent of validation data used')
         parser.add_argument("--limit_test_batches", default=0.005, type=float, help='Percent of test data used')
@@ -382,8 +385,10 @@ class NERLongformer(pl.LightningModule):
 
 NER = NERLongformer(args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs)
-trainer.fit(NER)
-
+#trainer.fit(NER)
+#NER = NERTransformer.load_from_checkpoint("./outputs/model.pt")
+results = trainer.test(NER)
+print(results)
 
 #########################################################################################################################
 
