@@ -9,9 +9,9 @@ Task.add_requirements('transformers', package_version='4.2.0')
 task = Task.init(project_name='LangGen', task_name='promptNER-fixedwords-Seq2Seq', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
-task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
-task.connect(args)
-task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+# task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+# task.connect(args)
+# task.execute_remotely(queue_name="128RAMv100", exit_process=True)
 
 class bucket_ops:
     StorageManager.set_cache_file_limit(5, cache_context=None)
@@ -82,8 +82,8 @@ role_map = {
 
 #########################################################################################################################################
 def convert_templates_to_prompts(templates, tokenizer):
-    templates = [["Entities that are {} are: {} {}".format(key, doc[key], tokenizer.sep_token) for key in doc.keys()] for doc in templates]
-    template_strings = ["{}".format(' '.join(doc)) for doc in templates]
+    templates = [["{} are: {}".format(key, doc[key]) for key in doc.keys()] for doc in templates]
+    template_strings = [" {} ".format(str(tokenizer.sep_token).join(doc)) for doc in templates]
     return template_strings
 
 class NERDataset(Dataset):
@@ -99,7 +99,7 @@ class NERDataset(Dataset):
         
         #self.encodings = self.tokenizer(self.docs, padding=True, truncation=True, max_length=1024, return_tensors="pt")
 
-        max_length = 1024
+        max_length = 2048
         input_ids = [self.tokenizer.encode(doc) for doc in self.docs]
         input_ids = torch.stack([torch.tensor(tokens+(max_length-len(tokens))*[self.tokenizer.pad_token_id]) if len(tokens)<max_length else torch.tensor(tokens[:max_length]) for tokens in input_ids])
 
@@ -155,29 +155,10 @@ class NERDataset(Dataset):
 # train_data = NERDataset(train_data, tokenizer)
 #import ipdb; ipdb.set_trace()
 
-# beam search
-def beam_search_decoder(data, k):
-	sequences = [[list(), 0.0]]
-	# walk over each step in sequence
-	for row in data:
-		all_candidates = list()
-		# expand each current candidate
-		for i in range(len(sequences)):
-			seq, score = sequences[i]
-			for j in range(len(row)):
-				candidate = [seq + [j], score - log(row[j])]
-				all_candidates.append(candidate)
-		# order all candidates by score
-		ordered = sorted(all_candidates, key=lambda tup:tup[1])
-		# select k best
-		sequences = ordered[:k]
-	return sequences
-
-
 ####################################################################################################################
 from transformers import LEDTokenizer, LEDForConditionalGeneration
 
-class NERLongformer(pl.LightningModule):
+class NERLED(pl.LightningModule):
     """Pytorch Lightning module. It wraps up the model, data loading and training code"""
     def __init__(self, params):
         """Loads the model, the tokenizer and the metric."""
@@ -187,8 +168,11 @@ class NERLongformer(pl.LightningModule):
         self.dataset = muc4
 
         # Load and update config then load a pretrained LEDForConditionalGeneration
-        self.config = AutoConfig.from_pretrained('allenai/led-base-16384')
-        self.config.gradient_checkpointing = self.args.grad_ckpt
+        # self.config = AutoConfig.from_pretrained('allenai/led-base-16384')
+        # self.config.gradient_checkpointing = True
+        # self.config.max_encoder_position_embeddings = 4096
+        # self.config.max_decoder_position_embeddings = 1024
+
         #self.model = AutoModelForSeq2SeqLM.from_pretrained('allenai/led-base-16384', config=self.config)
         self.model = LEDForConditionalGeneration.from_pretrained("allenai/led-base-16384")
 
@@ -219,13 +203,14 @@ class NERLongformer(pl.LightningModule):
         # # Global attention on periods
         # global_attention_mask[(input_ids == self.tokenizer.convert_tokens_to_ids('.'))] = 1
 
+        global_attention_mask[(input_ids == self.tokenizer.sep_token_id)] = 1
+
         return global_attention_mask
 
     def forward(self, **batch):
         """Call LEDForConditionalGeneration.forward"""
         
         input_ids, attention_mask, decoder_input_ids, decoder_mask  = batch["input_ids"], batch["attention_mask"], batch["decoder_input_ids"], batch["decoder_mask"]
-        batch_size = input_ids.size()[0]
 
         # Pass both the prompt-prepended input_embeds and decoder_input_embeds to the transformer model
         outputs = self.model(input_ids=input_ids,
@@ -259,23 +244,6 @@ class NERLongformer(pl.LightningModule):
         """Call the forward pass then return loss"""
         outputs = self.forward(**batch)
         return {'loss': outputs[0]}
-
-    def configure_optimizers(self):
-        """Configure the optimizer and the learning rate scheduler"""
-        # Freeze the model
-        for idx, (name, parameters) in enumerate(self.model.named_parameters()):
-            if idx>6:
-                parameters.requires_grad=False
-            else:
-                parameters.requires_grad=True
-
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
-        dataset_size = len(self.dataset['train'])
-        gpu_count = torch.cuda.device_count()
-        num_steps = dataset_size * self.args.num_epochs / gpu_count / self.args.grad_accum / self.args.batch_size
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=self.args.warmup,
-                                                    num_training_steps=num_steps)
-        return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
 
     def _get_dataloader(self, split_name, is_train):
         """Get training and validation dataloaders"""
@@ -359,6 +327,24 @@ class NERLongformer(pl.LightningModule):
         self._evaluation_step('test', batch, batch_nb)
 
 
+    def configure_optimizers(self):
+        """Configure the optimizer and the learning rate scheduler"""
+        # Freeze the model
+        for idx, (name, parameters) in enumerate(self.model.named_parameters()):
+            if idx>6:
+                parameters.requires_grad=False
+            else:
+                parameters.requires_grad=True
+
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
+        dataset_size = len(self.dataset['train'])
+        gpu_count = torch.cuda.device_count()
+        num_steps = dataset_size * self.args.num_epochs / gpu_count / self.args.grad_accum / self.args.batch_size
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=self.args.warmup,
+                                                    num_training_steps=num_steps)
+        return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
+
+
     @staticmethod
     def add_model_specific_args(parser):
         # **************** Parameters that we will NOT change during this tutorial **************** #
@@ -388,17 +374,18 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
     monitor="val_accuracy", 
     mode="max", 
     save_top_k=1, 
-    save_weights_only=True
+    save_weights_only=True,
+    period=5
+    #every_n_epochs = 5
 )
 
 # trained_model_path = bucket_ops.get_file(
-#     remote_path="s3://experiment-logging/storage/LangGen/promptNER-fixedwords.54168c64dada47b1a6033865a9b7e705/models/epoch=9-step=1999.ckpt"
+#     remote_path="s3://experiment-logging/storage/ner-pretraining/NER-LM.7aa2cc034cdf4b619b1dbf9ffffac9b0/models/best_entity_lm.ckpt"
 #     )
-trained_model_path = "epoch=9-step=999.ckpt"
 
-#model = NERLongformer(args)
-model = NERLongformer.load_from_checkpoint(trained_model_path, params = args)
-trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs)
+model = NERLED(args)
+#model = NERLED.load_from_checkpoint(trained_model_path, params = args)
+trainer = pl.Trainer(gpus=0, max_epochs=args.num_epochs)
 trainer.fit(model)
 results = trainer.test(model)
 print(results)
