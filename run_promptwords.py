@@ -2,17 +2,16 @@ from clearml import Task, StorageManager, Dataset
 import argparse
 import json, os
 
-#Task.add_requirements('transformers', package_version='4.2.0')
-task = Task.init(project_name='LangGen', task_name='promptNER-fixedwords-Seq2Seq', output_uri="s3://experiment-logging/storage/")
-clearlogger = task.get_logger()
-
 config = json.load(open('config.json'))
 args = argparse.Namespace(**config)
+
+Task.add_requirements('transformers', package_version='4.2.0')
+task = Task.init(project_name='LangGen', task_name='promptNER-fixedwords-Seq2Seq', output_uri="s3://experiment-logging/storage/")
+clearlogger = task.get_logger()
 
 task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
 task.connect(args)
 task.execute_remotely(queue_name="128RAMv100", exit_process=True)
-
 
 class bucket_ops:
     StorageManager.set_cache_file_limit(5, cache_context=None)
@@ -70,6 +69,8 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoConfig, AutoModelForSeq2SeqLM, set_seed, get_linear_schedule_with_warmup
 from seqeval.metrics import f1_score, precision_score, recall_score, accuracy_score
+from rouge_score import rouge_scorer
+
 
 role_map = {
     'PerpOrg': 'perpetrator organizations', 
@@ -81,7 +82,7 @@ role_map = {
 
 #########################################################################################################################################
 def convert_templates_to_prompts(templates, tokenizer):
-    templates = [["The entities that are {} are: {} {}".format(key, doc[key], tokenizer.sep_token) for key in doc.keys()] for doc in templates]
+    templates = [["Entities that are {} are: {} {}".format(key, doc[key], tokenizer.sep_token) for key in doc.keys()] for doc in templates]
     template_strings = ["{}".format(' '.join(doc)) for doc in templates]
     return template_strings
 
@@ -154,14 +155,31 @@ class NERDataset(Dataset):
 # train_data = NERDataset(train_data, tokenizer)
 #import ipdb; ipdb.set_trace()
 
+# beam search
+def beam_search_decoder(data, k):
+	sequences = [[list(), 0.0]]
+	# walk over each step in sequence
+	for row in data:
+		all_candidates = list()
+		# expand each current candidate
+		for i in range(len(sequences)):
+			seq, score = sequences[i]
+			for j in range(len(row)):
+				candidate = [seq + [j], score - log(row[j])]
+				all_candidates.append(candidate)
+		# order all candidates by score
+		ordered = sorted(all_candidates, key=lambda tup:tup[1])
+		# select k best
+		sequences = ordered[:k]
+	return sequences
+
 
 ####################################################################################################################
 from transformers import LEDTokenizer, LEDForConditionalGeneration
 
 class NERLongformer(pl.LightningModule):
     """Pytorch Lightning module. It wraps up the model, data loading and training code"""
-
-    def __init__(self, params, prompt_list=None):
+    def __init__(self, params):
         """Loads the model, the tokenizer and the metric."""
         super().__init__()
         self.save_hyperparameters()
@@ -169,13 +187,14 @@ class NERLongformer(pl.LightningModule):
         self.dataset = muc4
 
         # Load and update config then load a pretrained LEDForConditionalGeneration
-        self.config = AutoConfig.from_pretrained("allenai/led-base-16384")
-        self.config.gradient_checkpointing = True        
-        #self.model = LEDForConditionalGeneration.from_pretrained("allenai/led-base-16384")
-        self.model = AutoModelForSeq2SeqLM.from_pretrained("allenai/led-base-16384")
+        self.config = AutoConfig.from_pretrained('allenai/led-base-16384')
+        self.config.gradient_checkpointing = self.args.grad_ckpt
+        #self.model = AutoModelForSeq2SeqLM.from_pretrained('allenai/led-base-16384', config=self.config)
+        self.model = LEDForConditionalGeneration.from_pretrained("allenai/led-base-16384")
 
         # Load tokenizer and metric
         self.tokenizer = LEDTokenizer.from_pretrained('allenai/led-base-16384', use_fast=True)
+        self.scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
 
     def _set_global_attention_mask(self, input_ids):
         """Configure the global attention pattern based on the task"""
@@ -246,9 +265,9 @@ class NERLongformer(pl.LightningModule):
         # Freeze the model
         for idx, (name, parameters) in enumerate(self.model.named_parameters()):
             if idx>6:
-                parameters.requires_grad=True
-            else:
                 parameters.requires_grad=False
+            else:
+                parameters.requires_grad=True
 
         optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
         dataset_size = len(self.dataset['train'])
@@ -262,7 +281,10 @@ class NERLongformer(pl.LightningModule):
         """Get training and validation dataloaders"""
         dataset_split = self.dataset[split_name]
         dataset = NERDataset(dataset=dataset_split, tokenizer=self.tokenizer)
-        return DataLoader(dataset, batch_size=self.args.batch_size, num_workers=self.args.num_workers, collate_fn=NERDataset.collate_fn)
+        if split_name in ["val", "test"]:
+            return DataLoader(dataset, batch_size=self.args.eval_batch_size, num_workers=self.args.num_workers, collate_fn=NERDataset.collate_fn)
+        else:
+            return DataLoader(dataset, batch_size=self.args.batch_size, num_workers=self.args.num_workers, collate_fn=NERDataset.collate_fn)
 
     def train_dataloader(self):
         return self._get_dataloader('train', is_train=True)
@@ -273,38 +295,69 @@ class NERLongformer(pl.LightningModule):
     def test_dataloader(self):
         return self._get_dataloader('test', is_train=False)
 
+    def generate(self, **kwargs):
+        return self.model.generate(**kwargs)
+
     def _evaluation_step(self, split, batch, batch_nb):
         """Validaton or Testing - predict output, compare it with gold, compute rouge1, 2, L, and log result"""
+
         labels = batch.pop("labels", None)
-
-        outputs = self(**batch)
-        logits = nn.Softmax(dim=-1)(outputs[0])
-        logits = torch.argmax(logits, dim=-1)
-        predictions = torch.masked_select(logits, batch["decoder_mask"])
-
-        # Convert predicted and gold token ids to strings
-        predictions = self.tokenizer.batch_decode(predictions.tolist(), skip_special_tokens=True)
         gold = self.tokenizer.batch_decode(labels.tolist(), skip_special_tokens=True)
 
-        # Probably need to change this
-        print(predictions)
-        print("gold: {}".format(gold))
+        if split=="val":
+            outputs = self(**batch)[0]
+            logits = nn.Softmax(dim=-1)(outputs)
+            preds = torch.argmax(logits, dim=-1)[:,-1].unsqueeze(1)            
+            acc = accuracy_score(preds, gold)
+            logs = {
+                "val_accuracy": acc
+            }
+            self.log("val_accuracy", logs["val_accuracy"])
+        else:
+            batch_size = batch["input_ids"].size()[0]
 
+            # decoder_input_ids  = torch.tensor([self.tokenizer.cls_token_id], device=self.device).repeat(batch_size, 1)
+            # decoder_mask = ~(decoder_input_ids== self.tokenizer.pad_token_id)
+            # batch = {**batch, "decoder_input_ids": decoder_input_ids, "decoder_mask": decoder_mask}
 
-        acc = accuracy_score(predictions, gold)
+            # for i in range(self.args.max_output_len):        
+            #     outputs = self(**batch)
+            #     logits = nn.Softmax(dim=-1)(outputs[0])
+            #     preds = torch.argmax(logits, dim=-1)[:,-1].unsqueeze(1)            
+            #     batch["decoder_input_ids"] = torch.cat([batch["decoder_input_ids"], preds], dim=1)
+            #     batch["decoder_mask"] = ~(batch["decoder_input_ids"] == self.tokenizer.pad_token_id)
 
-        logs = {
-            "val_accuracy": acc
-        }
+                #import ipdb; ipdb.set_trace()
 
-        self.log("val_accuracy", logs["val_accuracy"])
+            predictions = self.generate(input_ids=batch["input_ids"], num_beams=5, num_return_sequences=1)
 
+            # # Convert predicted and gold token ids to strings
+            predictions = self.tokenizer.batch_decode(predictions.tolist(), skip_special_tokens=True)
+
+            print(predictions)
+
+            scores = self.scorer.score(' '.join(predictions),
+                                ' '.join(gold))
+
+            logs = {
+                "rouge": scores
+            }
+            #self.log("rouge", logs["rouge"]) #must be tensor
+
+            print("preds: ", predictions)
+            print("rouge: ", logs["rouge"])
+            
+            # return {"predictions": predictions}
+
+    # def test_epoch_end(self, outputs):
+    #     return {"preds": outputs}
 
     def validation_step(self, batch, batch_nb):
         self._evaluation_step('val', batch, batch_nb)
 
     def test_step(self, batch, batch_nb):
         self._evaluation_step('test', batch, batch_nb)
+
 
     @staticmethod
     def add_model_specific_args(parser):
@@ -338,14 +391,15 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
     save_weights_only=True
 )
 
-NER = NERLongformer(args)
-trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs)
-trainer.fit(NER)
-
 # trained_model_path = bucket_ops.get_file(
 #     remote_path="s3://experiment-logging/storage/LangGen/promptNER-fixedwords.54168c64dada47b1a6033865a9b7e705/models/epoch=9-step=1999.ckpt"
 #     )
-#model = NER.load_from_checkpoint(trained_model_path, params = args)
-#results = trainer.test(model)
-#print(results)
+trained_model_path = "epoch=9-step=999.ckpt"
+
+#model = NERLongformer(args)
+model = NERLongformer.load_from_checkpoint(trained_model_path, params = args)
+trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs)
+trainer.fit(model)
+results = trainer.test(model)
+print(results)
 

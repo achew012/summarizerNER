@@ -9,9 +9,9 @@ clearlogger = task.get_logger()
 config = json.load(open('config.json'))
 args = argparse.Namespace(**config)
 
-#task.connect(args)
-#task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
-#task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+task.connect(args)
+task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+task.execute_remotely(queue_name="128RAMv100", exit_process=True)
 
 
 
@@ -71,7 +71,7 @@ from torch import nn
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoConfig, AutoModelForSeq2SeqLM, set_seed, get_linear_schedule_with_warmup
-#from transformers import LEDTokenizer, LEDForConditionalGeneration
+from transformers import LEDTokenizer, LEDForConditionalGeneration
 
 role_map = {
     'PerpOrg': 'perpetrator organizations', 
