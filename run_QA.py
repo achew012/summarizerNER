@@ -180,7 +180,7 @@ class NERLED(pl.LightningModule):
 
         return global_attention_mask
 
-    def forward(self, **batch):       
+    def forward(self, **batch): 
         outputs = self.model(**batch)
         # outputs = self.model(input_ids=input_ids,
         #             attention_mask=attention_mask,  # mask padding tokens
