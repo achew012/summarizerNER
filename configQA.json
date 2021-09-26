@@ -11,12 +11,12 @@
 "output_dir": "./saved_models/test", 
 "val_every": 0.33, 
 "max_input_len": 1024, 
-"batch_size": 1, 
+"batch_size": 8, 
 "eval_batch_size": 2, 
 "grad_accum": 1, 
 "fp16": false, 
 "grad_ckpt": false, 
-"attention_window": 256,
+"attention_window": 512,
 "num_epochs": 10,
 "model": "allenai/led-base-16384"
 }

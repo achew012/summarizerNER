@@ -6,7 +6,7 @@ import json, os
 task = Task.init(project_name='LangGen', task_name='promptNER', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
-config = json.load(open('config.json'))
+config = json.load(open('config-prefix.json'))
 args = argparse.Namespace(**config)
 
 task.connect(args)
@@ -97,7 +97,7 @@ def convert_templates_to_prompts(templates, tokenizer, prompt_embeds=True):
 class NERDataset(Dataset):
     # doc_list
     # extracted_list as template
-    def __init__(self, dataset, tokenizer):
+    def __init__(self, dataset, tokenizer, args):
         self.tokenizer = tokenizer
         self.docs = [doc["doctext"] for doc in dataset]
         # take only 1st mention of each role
@@ -106,8 +106,8 @@ class NERDataset(Dataset):
         self.train_templates = convert_templates_to_prompts(first_mention_extracts, tokenizer)
         
         #self.encodings = self.tokenizer(self.docs, padding=True, truncation=True, max_length=1024, return_tensors="pt")
-        max_length = 1024
-        tgt_max_length = 512
+        max_length = args.max_input_len
+        tgt_max_length = args.max_output_len
         input_ids = [self.tokenizer.encode(doc) for doc in self.docs]
         input_ids = torch.stack([torch.tensor(tokens+(max_length-len(tokens))*[self.tokenizer.pad_token_id]) if len(tokens)<max_length else torch.tensor(tokens[:max_length]) for tokens in input_ids])
 
@@ -309,7 +309,7 @@ class NERLongformer(pl.LightningModule):
     def _get_dataloader(self, split_name, is_train):
         """Get training and validation dataloaders"""
         dataset_split = self.dataset[split_name]
-        dataset = NERDataset(dataset=dataset_split, tokenizer=self.tokenizer)
+        dataset = NERDataset(dataset=dataset_split, tokenizer=self.tokenizer, args=self.args)
         return DataLoader(dataset, batch_size=self.args.batch_size, num_workers=self.args.num_workers, collate_fn=NERDataset.collate_fn)
 
     def train_dataloader(self):
@@ -383,10 +383,10 @@ class NERLongformer(pl.LightningModule):
 # )
 
 
-NER = NERLongformer(args)
+#NER = NERLongformer(args)
+NER = NERLongformer.load_from_checkpoint("./outputs/model.pt")
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs)
-#trainer.fit(NER)
-#NER = NERTransformer.load_from_checkpoint("./outputs/model.pt")
+trainer.fit(NER)
 results = trainer.test(NER)
 print(results)
 
