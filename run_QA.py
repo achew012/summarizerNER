@@ -5,8 +5,7 @@ import json, os
 config = json.load(open('config.json'))
 args = argparse.Namespace(**config)
 
-Task.add_requirements('transformers', package_version='4.2.0')
-task = Task.init(project_name='LangGen', task_name='promptNER-QA', output_uri="s3://experiment-logging/storage/")
+task = Task.init(project_name='LangGen', task_name='promptNER-QA-train', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
 task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
@@ -92,13 +91,13 @@ class NERDataset(Dataset):
         #     } for doc in dataset]
 
         self.first_mention_position = {
-            "qns": [role_map[key].lower()  for doc in dataset for key in doc["extracts"].keys()], 
+            "qns": ["who are the {} entities?".format(role_map[key].lower()) for doc in dataset for key in doc["extracts"].keys()], 
             "context": [doc["doctext"] for doc in dataset for key in doc["extracts"].keys()], 
             "start": [doc["extracts"][key][0][0][1] if len(doc["extracts"][key])>0 else 0 for doc in dataset for key in doc["extracts"].keys()], 
-            "end": [doc["extracts"][key][0][0][1]+len(doc["extracts"][key][0][0][0]) if len(doc["extracts"][key])>0 else 0 for doc in dataset for key in doc["extracts"].keys()]
+            "end": [doc["extracts"][key][0][0][1]+len(self.tokenizer.encode(doc["extracts"][key][0][0][0])) if len(doc["extracts"][key])>0 else 0 for doc in dataset for key in doc["extracts"].keys()]
             }
 
-        self.context = tokenizer(self.first_mention_position["qns"], self.first_mention_position["context"], padding=True, truncation=True, max_length=768, return_tensors="pt")
+        self.context = tokenizer(self.first_mention_position["qns"], self.first_mention_position["context"], padding=True, truncation=True, max_length=1024, return_tensors="pt")
 
     def __len__(self):
         """Returns length of the dataset"""
@@ -170,7 +169,7 @@ class NERLED(pl.LightningModule):
         # not a conceptual one (PyTorch 1.8.1).
         # The following line puts global attention on the <s> token to make sure all model
         # parameters which is necessery for gradient accumulation to work.
-        global_attention_mask[:, :1] = 1
+        #global_attention_mask[:, :1] = 1
 
         # # Global attention on the first 100 tokens
         # global_attention_mask[:, :100] = 1
@@ -178,16 +177,32 @@ class NERLED(pl.LightningModule):
         # # Global attention on periods
         # global_attention_mask[(input_ids == self.tokenizer.convert_tokens_to_ids('.'))] = 1
 
+        batch_size = input_ids.size()[0]
+        question_separators = (input_ids == 2).nonzero(as_tuple=True)
+        sep_indices_batch = [torch.masked_select(question_separators[1], torch.eq(question_separators[0], batch_num))[0] for batch_num in range(batch_size)]
+
+        for batch_num in range(batch_size):
+            global_attention_mask[batch_num, :sep_indices_batch[batch_num]]=1
+
         return global_attention_mask
 
     def forward(self, **batch): 
-        outputs = self.model(**batch)
-        # outputs = self.model(input_ids=input_ids,
-        #             attention_mask=attention_mask,  # mask padding tokens
-        #             start_positions=start,
-        #             end_positions=end,
-        #             use_cache=False)
+        input_ids, attention_mask = batch["input_ids"], batch["attention_mask"], 
+        
+        if "start_positions" in batch.keys():
+            start, end = batch["start_positions"], batch["end_positions"]
+            outputs = self.model(input_ids=input_ids,
+                            attention_mask=attention_mask,  # mask padding tokens
+                            #global_attention_mask=self._set_global_attention_mask(input_ids),
+                            start_positions=start,
+                            end_positions=end,
+                            use_cache=False)
+        else:
+            outputs = self.model(input_ids=input_ids,
+                            attention_mask=attention_mask,  # mask padding tokens
+                            use_cache=False)
 
+        # outputs = self.model(**batch)
         # start_logits = outputs.start_logits
         # end_logits = outputs.end_logits          
         return outputs
@@ -221,16 +236,63 @@ class NERLED(pl.LightningModule):
     def _evaluation_step(self, split, batch, batch_nb):
         """Validaton or Testing - predict output, compare it with gold, compute rouge1, 2, L, and log result"""
 
-        # input_ids, attention_mask, start, end  = batch["input_ids"], batch["attention_mask"], batch["start"], batch["end"]
+        # input_ids, attention_mask, start, end  = batch["input_ids"], batch["attention_mask"], batch["start_positions"], batch["end_positions"]
+
+        start = batch.pop("start_positions")
+        end = batch.pop("end_positions")
+
         outputs = self(**batch)  # mask padding tokens
         
-        candidates = torch.topk(outputs.start_logits, 3)
+        candidates_start_batch = torch.topk(outputs.start_logits, 20)
+        candidates_end_batch = torch.topk(outputs.end_logits, 20)
 
-        for sample in candidates.indices:
-            print(self.tokenizer.decode(sample))
+        # Get qns mask
+        batch_size = batch["input_ids"].size()[0]
+        question_separators = (batch["input_ids"] == 2).nonzero(as_tuple=True)
+        sep_indices_batch = [torch.masked_select(question_separators[1], torch.eq(question_separators[0], batch_num))[0] for batch_num in range(batch_size)]
+        question_indices_batch = [[i+1 for i,token in enumerate(tokens[1:sep_idx+1])] for tokens, sep_idx in zip(batch["input_ids"], sep_indices_batch)]
 
-        # import ipdb; ipdb.set_trace()
+        for start_candidates, start_candidates_logits, end_candidates, end_candidates_logits, sample, question_indices in zip(candidates_start_batch.indices, candidates_start_batch.values, candidates_end_batch.indices, candidates_end_batch.values, batch["input_ids"], question_indices_batch):
+            prelim_preds = []
+            for start_index, start_score in zip(start_candidates, start_candidates_logits):
+                for end_index, end_score in zip(end_candidates, end_candidates_logits):
+                    # throw out invalid predictions
+                    if start_index in question_indices:
+                        continue
+                    if end_index in question_indices:
+                        continue
+                    if end_index < start_index:
+                        continue
+                    if (end_index-start_index)>30:
+                        continue
+                    # if (end_index<torch.masked_select(sample, ~(sample == self.tokenizer.pad_token_id), 0)):
+                    #     continue
+                    if start_index==0:
+                        if len(prelim_preds)<1:
+                            prelim_preds.append(
+                                {
+                                    "qns": self.tokenizer.decode(sample[1:len(question_indices)+1]),
+                                    # "context": self.tokenizer.decode(sample)[1+len(question_indices):], 
+                                    "start": start_index,
+                                    "end": end_index,
+                                    "mention": "no answer",
+                                    "score": 0
+                                }
+                            )
+                    else:
+                        prelim_preds.append(
+                            {
+                                "qns": self.tokenizer.decode(sample[1:len(question_indices)+1]),
+                                # "context": self.tokenizer.decode(sample)[1+len(question_indices):], 
+                                "start": start_index,
+                                "end": end_index,
+                                "mention": self.tokenizer.decode(sample[start_index:end_index]),
+                                "score": start_score+end_score
+                            }
+                    )
 
+        print("preds: ", prelim_preds[:5])
+                         
         logs = {
             "val_loss": outputs.loss
         }
