@@ -2,16 +2,36 @@ from clearml import Task, StorageManager, Dataset
 import argparse
 import json, os
 
-config = json.load(open('configQA.json'))
+config = {
+"seed": 1234, 
+"lr": 1e-04, 
+"warmup": 1000, 
+"num_workers": 4, 
+"limit_val_batches": 0.005, 
+"limit_test_batches": 0.005, 
+"limit_train_batches": 0.002, 
+"max_output_len": 64, 
+"data_dir": "/data",
+"output_dir": "./saved_models/test", 
+"val_every": 0.33, 
+"max_input_len": 1024, 
+"batch_size": 1, 
+"eval_batch_size": 2, 
+"grad_accum": 1, 
+"fp16": False, 
+"grad_ckpt": False, 
+"attention_window": 256,
+"num_epochs": 2,
+}
 args = argparse.Namespace(**config)
 
 Task.add_requirements('transformers', package_version='4.2.0')
 task = Task.init(project_name='LangGen', task_name='promptNER-fixedwords', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
-# task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
-# task.connect(args)
-# task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+task.connect(args)
+task.execute_remotely(queue_name="128RAMv100", exit_process=True)
 
 class bucket_ops:
     StorageManager.set_cache_file_limit(5, cache_context=None)
@@ -65,7 +85,7 @@ from torch import nn
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset
 from rouge_score import rouge_scorer
-from constrained_gen import LEDConstrainedGen
+from led_model import LEDConstrainedGen
 
 role_map = {
     'PerpOrg': 'perpetrator organizations', 
@@ -92,7 +112,7 @@ class NERDataset(Dataset):
         # convert extracts to prompt template
         self.input_template, self.filled_templates = convert_templates_to_prompts(first_mention_extracts, tokenizer)
         self.encodings = self.tokenizer(self.input_template, self.docs, padding="max_length", truncation=True, max_length=args.max_input_len, return_tensors="pt")        
-        self.decoder_encodings = self.tokenizer(self.input_template, padding="max_length", truncation=True, max_length=args.max_output_len, return_tensors="pt")
+        self.decoder_encodings = self.tokenizer(self.filled_templates, padding="max_length", truncation=True, max_length=args.max_output_len, return_tensors="pt")
         # import ipdb; ipdb.set_trace()
 
     def __len__(self):
@@ -126,12 +146,12 @@ class NERDataset(Dataset):
         return {
             "input_token_ids": input_ids,
             "input_attn_mask": attention_mask,
-            "tgt_input_ids": decoder_input_ids,
+            "tgt_token_ids": decoder_input_ids,
             "tgt_attn_mask": decoder_mask 
         }
 
 ####################################################################################################################
-from transformers import LEDTokenizer, LEDModel, AutoConfig 
+from transformers import LEDTokenizer, LEDModel, AutoConfig, get_linear_schedule_with_warmup 
 
 class NERLED(pl.LightningModule):
     """Pytorch Lightning module. It wraps up the model, data loading and training code"""
@@ -144,7 +164,6 @@ class NERLED(pl.LightningModule):
 
         # Load and update config then load a pretrained LEDForConditionalGeneration
         self.config = AutoConfig.from_pretrained('allenai/led-base-16384')
-        self.config.gradient_checkpointing = True
 
         # Load tokenizer and metric
         self.tokenizer = LEDTokenizer.from_pretrained('allenai/led-base-16384', use_fast=True)
@@ -165,6 +184,7 @@ class NERLED(pl.LightningModule):
                     "task": 0 
                 }
         outputs = self.model(**inputs)
+
         loss = outputs[0]
         loss = torch.mean(loss)
 
@@ -174,7 +194,7 @@ class NERLED(pl.LightningModule):
 
         return {
             'loss': loss, 
-            'log': log 
+            'log': log
         }
 
     def _get_dataloader(self, split_name, is_train):
@@ -216,81 +236,77 @@ class NERLED(pl.LightningModule):
         } 
         return {
             'loss': avg_loss, 
-            'log': log 
+            'log': log
         }
 
     def test_step(self, batch, batch_idx):
-        if self.hparams.sample_gen:
-            sample_output = self.model.generate(batch['input_token_ids'], do_sample=True, 
-                                top_k=20, top_p=0.95, max_length=30, num_return_sequences=1,num_beams=1,
-                            )
-        else:
-            sample_output = self.model.generate(batch['input_token_ids'], do_sample=False, 
-                                max_length=30, num_return_sequences=1,num_beams=1,
-                            )
+        # if self.args.sample_gen:
+        #     sample_output = self.model.generate(batch['input_token_ids'], do_sample=True, 
+        #                         top_k=20, top_p=0.95, max_length=30, num_return_sequences=1,num_beams=1,
+        #                     )
+        # else:
+        sample_output = self.model.generate(batch['input_token_ids'], do_sample=False, 
+                            max_length=30, num_return_sequences=1,num_beams=1,
+                        )
         
         sample_output = sample_output.reshape(batch['input_token_ids'].size(0), 1, -1)
-        doc_key = batch['doc_key'] # list 
+        # doc_key = batch['doc_key'] # list 
         tgt_token_ids = batch['tgt_token_ids']
 
-        return (doc_key, sample_output, tgt_token_ids) 
+        return {"preds": sample_output, "gold": tgt_token_ids} 
 
     def test_epoch_end(self, outputs):
         # evaluate F1 
-        with open('checkpoints/{}/predictions.jsonl'.format(self.hparams.ckpt_name),'w') as writer:
-            for tup in outputs:
-                for idx in range(len(tup[0])):
-                    
+        with open('predictions.jsonl','w') as writer:
+            for x in outputs:
+                for idx in range(len(x["preds"])):
                     pred = {
-                        'doc_key': tup[0][idx],
-                        'predicted': self.tokenizer.decode(tup[1][idx].squeeze(0), skip_special_tokens=True),
-                        'gold': self.tokenizer.decode(tup[2][idx].squeeze(0), skip_special_tokens=True) 
+                        'predicted': self.tokenizer.decode(x["preds"][idx].squeeze(0), skip_special_tokens=True),
+                        'gold': self.tokenizer.decode(x["gold"][idx].squeeze(0), skip_special_tokens=True) 
                     }
                     writer.write(json.dumps(pred)+'\n')
 
         return {} 
 
-    # def configure_optimizers(self):
-    #     """Configure the optimizer and the learning rate scheduler"""
-    #     # Freeze the model
-    #     # for idx, (name, parameters) in enumerate(self.model.named_parameters()):
-    #     #     if idx<6:
-    #     #         parameters.requires_grad=False
-    #     #     else:
-    #     #         parameters.requires_grad=True
-
-    #     optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
-    #     return [optimizer]    
-
     def configure_optimizers(self):
-        self.train_len = len(self.train_dataloader())
-        if self.hparams.max_steps > 0:
-            t_total = self.hparams.max_steps
-            self.hparams.num_train_epochs = self.hparams.max_steps // self.train_len // self.hparams.accumulate_grad_batches + 1
-        else:
-            t_total = self.train_len // self.hparams.accumulate_grad_batches * self.hparams.num_train_epochs
+        """Configure the optimizer and the learning rate scheduler"""
+        # Freeze the model
+        # for idx, (name, parameters) in enumerate(self.model.named_parameters()):
+        #     if idx<6:
+        #         parameters.requires_grad=False
+        #     else:
+        #         parameters.requires_grad=True
 
-        logger.info('{} training steps in total.. '.format(t_total)) 
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.args.lr)
+        return [optimizer]    
+
+    # def configure_optimizers(self):
+    #     self.train_len = len(self.train_dataloader())
+    #     if self.args.max_steps > 0:
+    #         t_total = self.args.max_steps
+    #         self.args.num_train_epochs = self.args.max_steps // self.train_len // self.args.accumulate_grad_batches + 1
+    #     else:
+    #         t_total = self.train_len // self.args.accumulate_grad_batches * self.args.num_train_epochs
         
-        # Prepare optimizer and schedule (linear warmup and decay)
-        no_decay = ["bias", "LayerNorm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)],
-                "weight_decay": self.hparams.weight_decay,
-            },
-            {"params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
-        ]
-        optimizer = AdamW(optimizer_grouped_parameters, lr=self.hparams.learning_rate, eps=self.hparams.adam_epsilon)
-        # scheduler is called only once per epoch by default 
-        scheduler =  get_linear_schedule_with_warmup(optimizer, num_warmup_steps=self.hparams.warmup_steps, num_training_steps=t_total)
-        scheduler_dict = {
-            'scheduler': scheduler,
-            'interval': 'step',
-            'name': 'linear-schedule',
-        }
+    #     # Prepare optimizer and schedule (linear warmup and decay)
+    #     no_decay = ["bias", "LayerNorm.weight"]
+    #     optimizer_grouped_parameters = [
+    #         {
+    #             "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)],
+    #             "weight_decay": self.args.weight_decay,
+    #         },
+    #         {"params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
+    #     ]
+    #     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
+    #     # scheduler is called only once per epoch by default 
+    #     scheduler =  get_linear_schedule_with_warmup(optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=t_total)
+    #     scheduler_dict = {
+    #         'scheduler': scheduler,
+    #         'interval': 'step',
+    #         'name': 'linear-schedule',
+    #     }
 
-        return [optimizer, ], [scheduler_dict,]
+    #     return [optimizer, ], [scheduler_dict,]
 
 checkpoint_callback = pl.callbacks.ModelCheckpoint(
     dirpath = "./",

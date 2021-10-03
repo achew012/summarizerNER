@@ -168,7 +168,7 @@ class LEDConstrainedGen(PreTrainedModel):
         decoder_input_ids=None, 
         decoder_attention_mask=None,
         output_attentions=None,
-        output_hidden_states=None,
+        output_hidden_states=True,
         return_dict=None, 
         input_embeds=None,
         task=-1):
@@ -179,13 +179,12 @@ class LEDConstrainedGen(PreTrainedModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
-            decoder_attention_mask=decoder_attention_mask,
             use_cache=use_cache, 
             encoder_outputs=encoder_outputs,
             past_key_values=past_key_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            input_embeds = input_embeds,
+            #input_embeds = input_embeds,
             global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
             return_dict=return_dict,)
 
@@ -197,7 +196,7 @@ class LEDConstrainedGen(PreTrainedModel):
 
             if input_embeds==None:
                 # get encoder side embeddings 
-                input_embeds = self.transformer.encoder.embed_tokens(input_ids) * self.transformer.encoder.embed_scale #(batch, seq_len, input_seq_len)
+                input_embeds = self.transformer.encoder.embed_tokens(input_ids) #* self.transformer.encoder.embed_scale #(batch, seq_len, input_seq_len)
             pointer_logits = torch.einsum('ijk,ilk->ijl', decoder_output, input_embeds) #(batch, seq_len, input_seq_len)
             lm_logits = self.convert_pointer_logits_to_lm_logits(pointer_logits, input_ids)
 
@@ -232,12 +231,11 @@ class LEDConstrainedGen(PreTrainedModel):
             input_ids,
             attention_mask=attention_mask,
             decoder_input_ids=y_ids,
-            decoder_attention_mask=decoder_attention_mask[:, :-1],
             use_cache=False, 
             past_key_values=past_key_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
+            #global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
             return_dict=return_dict,)
             
             decoder_output = outputs[0] #(batch, seq_len, hidden_dim)
@@ -245,7 +243,7 @@ class LEDConstrainedGen(PreTrainedModel):
             # lm_logits = F.linear(decoder_output, self.transformer.shared.weight, bias=self.final_logits_bias)
             # lm_logits = self.remove_unseen(lm_logits, input_ids)
             # get encoder side embeddings 
-            input_embeds = self.transformer.encoder.embed_tokens(input_ids) * self.transformer.encoder.embed_scale #(batch, seq_len, input_seq_len)
+            input_embeds = self.transformer.encoder.embed_tokens(input_ids) #* self.transformer.encoder.embed_scale #(batch, seq_len, input_seq_len)
 
             pointer_logits = torch.einsum('ijk,ilk->ijl', decoder_output, input_embeds) #(batch, seq_len, input_seq_len)
             # decrease <arg> prob if neccesary 
@@ -525,7 +523,7 @@ class LEDConstrainedGen(PreTrainedModel):
             # get encoder and store encoder outputs
             encoder = self.get_encoder()
             encoder_outputs: ModelOutput = encoder(input_ids, attention_mask=attention_mask, return_dict=True)
-            input_embeds = encoder.embed_tokens(input_ids)  * encoder.embed_scale 
+            input_embeds = encoder.embed_tokens(input_ids) # * encoder.embed_scale 
 
         # Expand input ids if num_beams > 1 or num_return_sequences > 1
         if num_return_sequences > 1 or num_beams > 1:

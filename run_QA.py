@@ -393,5 +393,5 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
 model = NERLongformerQA(args)
 #model = NERLongformerQA.load_from_checkpoint(trained_model_path, params = args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback])
-trainer.fit(model)
+#trainer.fit(model)
 results = trainer.test(model)
