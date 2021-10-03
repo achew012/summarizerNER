@@ -42,9 +42,9 @@ args = argparse.Namespace(**config)
 task = Task.init(project_name='LangGen', task_name='promptNER-QA-train', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
-task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
-task.connect(args)
-task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+# task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+# task.connect(args)
+# task.execute_remotely(queue_name="128RAMv100", exit_process=True)
 
 class bucket_ops:
     StorageManager.set_cache_file_limit(5, cache_context=None)
@@ -118,17 +118,36 @@ class NERDataset(Dataset):
     def __init__(self, dataset, tokenizer, args):
         self.tokenizer = tokenizer
         self.first_mention_position = {
+            "docid": [doc["docid"] for doc in dataset for key in doc["extracts"].keys()],
             "qns": ["who are the {} entities?".format(role_map[key].lower()) for doc in dataset for key in doc["extracts"].keys()], 
             "context": [doc["doctext"] for doc in dataset for key in doc["extracts"].keys()],
             }
 
         self.context = tokenizer(self.first_mention_position["qns"], self.first_mention_position["context"], padding=True, truncation=True, max_length=1024,     return_offsets_mapping=True, return_tensors="pt")
+        self.offsets = [[idx for idx, token in enumerate(tokens[:100]) if (idx!=0 and token[0]==0 and token[1]==0)] for tokens in self.context["offset_mapping"]]
+        
+        self.first_mention_position["start"]=[]
+        self.first_mention_position["end"]=[]
 
-        qns_offset = self.context.sequence_ids().index(1)-1
-        self.first_mention_position["start"] = [doc["extracts"][key][0][0][1]+qns_offset if len(doc["extracts"][key])>0 else 0 for doc in dataset for key in doc["extracts"].keys()]
-        self.first_mention_position["end"] = [doc["extracts"][key][0][0][1]+len(self.tokenizer.encode(doc["extracts"][key][0][0][0]))+qns_offset if len(doc["extracts"][key])>0 else 0 for doc in dataset for key in doc["extracts"].keys()]
-
-        # import ipdb; ipdb.set_trace()
+        idx=0
+        for doc in dataset:
+            for key in doc["extracts"].keys():                
+                if len(doc["extracts"][key])>0: 
+                    qns_offset = self.offsets[idx][1]
+                    mention_tokens = self.tokenizer.encode(doc["extracts"][key][0][0][0])
+                    context_len = len(self.tokenizer.encode(doc["doctext"]))         
+                    if (start_index+len(mention_tokens))<context_len:
+                        start_index = doc["extracts"][key][0][0][1] + qns_offset
+                        end_index = start_index+len(mention_tokens)+ qns_offset
+                    else:
+                        start_index=0
+                        end_index=0
+                else:
+                    start_index=0
+                    end_index=0
+                self.first_mention_position["start"].append(start_index)
+                self.first_mention_position["end"].append(end_index)
+                idx+=1
 
 
     def __len__(self):
@@ -138,6 +157,7 @@ class NERDataset(Dataset):
     def __getitem__(self, idx):
         """Gets an example from the dataset. The input and output are tokenized and limited to a certain seqlen."""
         item = {key: val[idx] for key, val in self.context.items()}
+        item['docid'] = self.first_mention_position["docid"][idx]
         item['start'] = torch.tensor(self.first_mention_position["start"])[idx]
         item['end'] = torch.tensor(self.first_mention_position["end"])[idx]
         return item
@@ -148,17 +168,15 @@ class NERDataset(Dataset):
         Groups multiple examples into one batch with padding and tensorization.
         The collate function is called by PyTorch DataLoader
         """
-        #pad_token_id = 1
-        #input_ids, output_ids = list(zip(*batch))
-        #input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=pad_token_id)
-        #output_ids = torch.nn.utils.rnn.pad_sequence(output_ids, batch_first=True, padding_value=pad_token_id)
 
+        docids = [ex['docid'] for ex in batch]
         input_ids = torch.stack([ex['input_ids'] for ex in batch]) 
         attention_mask = torch.stack([ex['attention_mask'] for ex in batch]) 
         start = torch.stack([ex['start'] for ex in batch]) 
         end = torch.stack([ex['end'] for ex in batch]) 
         
         return {
+            'docid': docids,
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'start_positions': start,
@@ -294,21 +312,21 @@ class NERLongformerQA(pl.LightningModule):
                         continue
                     elif (end_index-start_index)>30:
                         continue
-                    elif (start_index)>(torch.count_nonzero(attention_mask)-len(question_indices)):
+                    elif (start_index)>(torch.count_nonzero(attention_mask)):
                         continue
 
                     if start_index==0:
                         if len(valid_candidates)<1:
                             valid_candidates.append((start_index.item(), end_index.item(), "no answer", 0))
                     else:
-                        valid_candidates.append((start_index.item(), end_index.item(),  self.tokenizer.decode(tokens[start_index:end_index+1]), (start_score+end_score).item()))
+                        valid_candidates.append((start_index.item(), end_index.item(),  self.tokenizer.decode(tokens[start_index:end_index]), (start_score+end_score).item()))
 
             batch_outputs.append(
                 {
                     "context": self.tokenizer.decode(torch.masked_select(tokens, torch.gt(attention_mask, 0))), 
                     "start_gold": start_gold.item(),
                     "end_gold": end_gold.item(),
-                    "gold": self.tokenizer.decode(tokens[start_gold:end_gold+1]),
+                    "gold": self.tokenizer.decode(tokens[start_gold:end_gold]),
                     "candidates": valid_candidates[:3]
                 }
             )
@@ -328,11 +346,11 @@ class NERLongformerQA(pl.LightningModule):
 
     def test_epoch_end(self, outputs):
         results = []
-        with open("predictions.txt", "w") as f:
-            for x in outputs:
-                results.append(x["results"])
-                f.write(str(x["results"])+'\n')
-            f.close()
+        # with open("predictions.txt", "w") as f:
+        #     for x in outputs:
+        #         results.append(x["results"])
+        #         f.write(str(x["results"])+'\n')
+        #     f.close()
 
         to_jsonl("predictions.jsonl", results)
 

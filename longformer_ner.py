@@ -1,6 +1,5 @@
 from datasets import load_dataset
 
-dataset = load_dataset("wnut_17")
 
 from clearml import Task, StorageManager, Dataset
 import argparse
@@ -43,10 +42,13 @@ class bucket_ops:
 #     remote_path="s3://experiment-logging/pretrained/led-base-16384", 
 #     )
 
+
 # #Read args from config file instead, use vars() to convert namespace to dict
-dataset = Dataset.get(dataset_name="muc4-processed", dataset_project="datasets/muc4", dataset_tags=["processed", "GRIT"], only_published=True)
-dataset_folder = dataset.get_local_copy()
-print(list(os.walk(os.path.join(dataset_folder, "data/muc4-grit/processed"))))
+#dataset = Dataset.get(dataset_name="muc4-processed", dataset_project="datasets/muc4", dataset_tags=["processed", "GRIT"], only_published=True)
+#dataset_folder = dataset.get_local_copy()
+#print(list(os.walk(os.path.join(dataset_folder, "data/muc4-grit/processed"))))
+
+dataset = load_dataset("wnut_17")
 
 def read_json(jsonfile):
     with open(jsonfile, 'rb') as file:
