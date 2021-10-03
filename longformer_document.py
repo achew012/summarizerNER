@@ -1,42 +1,8 @@
 from clearml import Task, StorageManager, Dataset
 import argparse
 import json, os
-import jsonlines
 
-def read_json(jsonfile):
-    with open(jsonfile, 'rb') as file:
-        file_object = [json.loads(sample) for sample in file]
-    return file_object
-
-''' Writes to a jsonl file'''
-def to_jsonl(filename:str, file_obj):
-    resultfile = open(filename, 'wb')
-    writer = jsonlines.Writer(resultfile)
-    writer.write_all(file_obj)
-
-config = {
-"seed": 1234, 
-"lr": 1e-04, 
-"warmup": 1000, 
-"num_workers": 4, 
-"limit_val_batches": 0.005, 
-"limit_test_batches": 0.005, 
-"limit_train_batches": 0.002, 
-"max_output_len": 64, 
-"data_dir": "/data",
-"output_dir": "./saved_models/test", 
-"val_every": 0.33, 
-"max_input_len": 1024, 
-"batch_size": 2, 
-"eval_batch_size": 4, 
-"grad_accum": 1, 
-"fp16": False, 
-"grad_ckpt": False, 
-"attention_window": 256,
-"num_epochs": 10,
-}
-#json.load(open('config.json'))
-
+config = json.load(open('config.json'))
 args = argparse.Namespace(**config)
 
 task = Task.init(project_name='LangGen', task_name='promptNER-QA-train', output_uri="s3://experiment-logging/storage/")
@@ -74,9 +40,9 @@ class bucket_ops:
 #     )
 
 # #Read args from config file instead, use vars() to convert namespace to dict
-dataset = Dataset.get(dataset_name="muc4-processed", dataset_project="datasets/muc4", dataset_tags=["processed", "GRIT"], only_published=True)
-dataset_folder = dataset.get_local_copy()
-print(list(os.walk(os.path.join(dataset_folder, "data/muc4-grit/processed"))))
+ds = Dataset.get(dataset_name="ace05-docs", dataset_project="datasets/ace05-event", dataset_tags=["processed", "GRIT"], only_published=True)
+dataset_folder = ds.get_local_copy()
+print(list(os.walk(dataset_folder)))
 
 def read_json(jsonfile):
     with open(jsonfile, 'rb') as file:
@@ -117,19 +83,22 @@ class NERDataset(Dataset):
     # extracted_list as template
     def __init__(self, dataset, tokenizer, args):
         self.tokenizer = tokenizer
+        # first_mention_position = [{
+        #     "qns": [role_map[key].lower() for key in doc["extracts"].keys()], 
+        #     "context": [doc["doctext"] for key in doc["extracts"].keys()], 
+        #     "start": [doc["extracts"][key][0][0][1] if len(doc["extracts"][key])>0 else None for key in doc["extracts"].keys()], 
+        #     "end": [doc["extracts"][key][0][0][1]+len(doc["extracts"][key][0][0][0]) if len(doc["extracts"][key])>0 else None for key in doc["extracts"].keys()]
+        #     } for doc in dataset]
+
         self.first_mention_position = {
             "qns": ["who are the {} entities?".format(role_map[key].lower()) for doc in dataset for key in doc["extracts"].keys()], 
             "context": [doc["doctext"] for doc in dataset for key in doc["extracts"].keys()],
+            # Add 3 in the indices to factor in <s>...</s></s>... 
+            "start": [doc["extracts"][key][0][0][1]+3 if len(doc["extracts"][key])>0 else 0 for doc in dataset for key in doc["extracts"].keys()], 
+            "end": [doc["extracts"][key][0][0][1]+len(self.tokenizer.encode(doc["extracts"][key][0][0][0]))+3 if len(doc["extracts"][key])>0 else 0 for doc in dataset for key in doc["extracts"].keys()]
             }
 
-        self.context = tokenizer(self.first_mention_position["qns"], self.first_mention_position["context"], padding=True, truncation=True, max_length=1024,     return_offsets_mapping=True, return_tensors="pt")
-
-        qns_offset = self.context.sequence_ids().index(1)-1
-        self.first_mention_position["start"] = [doc["extracts"][key][0][0][1]+qns_offset if len(doc["extracts"][key])>0 else 0 for doc in dataset for key in doc["extracts"].keys()]
-        self.first_mention_position["end"] = [doc["extracts"][key][0][0][1]+len(self.tokenizer.encode(doc["extracts"][key][0][0][0]))+qns_offset if len(doc["extracts"][key])>0 else 0 for doc in dataset for key in doc["extracts"].keys()]
-
-        # import ipdb; ipdb.set_trace()
-
+        self.context = tokenizer(self.first_mention_position["qns"], self.first_mention_position["context"], padding=True, truncation=True, max_length=1024, return_tensors="pt")
 
     def __len__(self):
         """Returns length of the dataset"""
@@ -166,9 +135,9 @@ class NERDataset(Dataset):
         }
 
 ####################################################################################################################
-from transformers import AutoTokenizer, AutoModelForQuestionAnswering
+from transformers import LEDTokenizer, LongformerModel
 
-class NERLongformerQA(pl.LightningModule):
+class LongformerEncoder(pl.LightningModule):
     """Pytorch Lightning module. It wraps up the model, data loading and training code"""
     def __init__(self, params):
         """Loads the model, the tokenizer and the metric."""
@@ -178,11 +147,11 @@ class NERLongformerQA(pl.LightningModule):
         self.dataset = muc4
 
         # Load and update config then load a pretrained LEDForConditionalGeneration
-        self.config = AutoConfig.from_pretrained("valhalla/longformer-base-4096-finetuned-squadv1")
+        self.config = AutoConfig.from_pretrained("allenai/longformer-base-4096")
         self.config.gradient_checkpointing = True
-        self.model = AutoModelForQuestionAnswering.from_pretrained("valhalla/longformer-base-4096-finetuned-squadv1", config=self.config)
+        self.model = LongformerModel.from_pretrained("allenai/longformer-base-4096", config=self.config)
         # Load tokenizer and metric
-        self.tokenizer = AutoTokenizer.from_pretrained("valhalla/longformer-base-4096-finetuned-squadv1", use_fast=True)
+        self.tokenizer = LEDTokenizer.from_pretrained("allenai/longformer-base-4096", use_fast=True)
 
     def _set_global_attention_mask(self, input_ids):
         """Configure the global attention pattern based on the task"""
@@ -218,19 +187,23 @@ class NERLongformerQA(pl.LightningModule):
 
     def forward(self, **batch): 
         input_ids, attention_mask = batch["input_ids"], batch["attention_mask"], 
-
+        
         if "start_positions" in batch.keys():
             start, end = batch["start_positions"], batch["end_positions"]
             outputs = self.model(input_ids=input_ids,
                             attention_mask=attention_mask,  # mask padding tokens
-                            global_attention_mask=self._set_global_attention_mask(input_ids),
+                            #global_attention_mask=self._set_global_attention_mask(input_ids),
                             start_positions=start,
-                            end_positions=end)
+                            end_positions=end,
+                            use_cache=False)
         else:
             outputs = self.model(input_ids=input_ids,
-                            attention_mask=attention_mask  # mask padding tokens
-            )
+                            attention_mask=attention_mask,  # mask padding tokens
+                            use_cache=False)
 
+        # outputs = self.model(**batch)
+        # start_logits = outputs.start_logits
+        # end_logits = outputs.end_logits          
         return outputs
 
     def training_step(self, batch, batch_nb):
@@ -261,84 +234,16 @@ class NERLongformerQA(pl.LightningModule):
 
     def _evaluation_step(self, split, batch, batch_nb):
         """Validaton or Testing - predict output, compare it with gold, compute rouge1, 2, L, and log result"""
-
         # input_ids, attention_mask, start, end  = batch["input_ids"], batch["attention_mask"], batch["start_positions"], batch["end_positions"]
 
-        # start = batch.pop("start_positions")
-        # end = batch.pop("end_positions")
 
-        outputs = self(**batch)  # mask padding tokens        
-        candidates_start_batch = torch.topk(outputs.start_logits, 20)
-        candidates_end_batch = torch.topk(outputs.end_logits, 20)
-
-        # Get qns mask
-        batch_size = batch["input_ids"].size()[0]
-        question_separators = (batch["input_ids"] == 2).nonzero(as_tuple=True)
-        sep_indices_batch = [torch.masked_select(question_separators[1], torch.eq(question_separators[0], batch_num))[0] for batch_num in range(batch_size)]
-        question_indices_batch = [[i+1 for i,token in enumerate(tokens[1:sep_idx+1])] for tokens, sep_idx in zip(batch["input_ids"], sep_indices_batch)]
-        batch_outputs = []
-
-        #For each sample in batch
-        for start_candidates, start_candidates_logits, end_candidates, end_candidates_logits, tokens, question_indices, start_gold, end_gold, attention_mask in zip(candidates_start_batch.indices, candidates_start_batch.values, candidates_end_batch.indices, candidates_end_batch.values, batch["input_ids"], question_indices_batch, batch["start_positions"], batch["end_positions"], batch["attention_mask"]):
-
-            valid_candidates = []
-            # For each candidate in sample
-            for start_index, start_score in zip(start_candidates, start_candidates_logits):
-                for end_index, end_score in zip(end_candidates, end_candidates_logits):
-                    # throw out invalid predictions
-                    if start_index in question_indices:
-                        continue
-                    elif end_index in question_indices:
-                        continue
-                    elif end_index < start_index:
-                        continue
-                    elif (end_index-start_index)>30:
-                        continue
-                    elif (start_index)>(torch.count_nonzero(attention_mask)-len(question_indices)):
-                        continue
-
-                    if start_index==0:
-                        if len(valid_candidates)<1:
-                            valid_candidates.append((start_index.item(), end_index.item(), "no answer", 0))
-                    else:
-                        valid_candidates.append((start_index.item(), end_index.item(),  self.tokenizer.decode(tokens[start_index:end_index+1]), (start_score+end_score).item()))
-
-            batch_outputs.append(
-                {
-                    "context": self.tokenizer.decode(torch.masked_select(tokens, torch.gt(attention_mask, 0))), 
-                    "start_gold": start_gold.item(),
-                    "end_gold": end_gold.item(),
-                    "gold": self.tokenizer.decode(tokens[start_gold:end_gold+1]),
-                    "candidates": valid_candidates[:3]
-                }
-            )
-
-        logs = {
-            "loss": outputs.loss
-        }        
-        
-        return {"loss": logs["loss"], "preds": batch_outputs}
+    # def test_epoch_end(self, outputs):
 
     def validation_step(self, batch, batch_nb):
         self._evaluation_step('val', batch, batch_nb)
 
     def test_step(self, batch, batch_nb):
-        out = self._evaluation_step('test', batch, batch_nb)
-        return {"results": out["preds"]}
-
-    def test_epoch_end(self, outputs):
-        results = []
-        with open("predictions.txt", "w") as f:
-            for x in outputs:
-                results.append(x["results"])
-                f.write(str(x["results"])+'\n')
-            f.close()
-
-        to_jsonl("predictions.jsonl", results)
-
-        task.upload_artifact(name='predictions', artifact_object="./predictions.jsonl")
-
-        return {"results": results}
+        self._evaluation_step('test', batch, batch_nb)
 
     def configure_optimizers(self):
         """Configure the optimizer and the learning rate scheduler"""
@@ -386,12 +291,14 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
 )
 
 # trained_model_path = bucket_ops.get_file(
-#     remote_path="s3://experiment-logging/storage/ner-pretraining/NER-LM.c1a2da99836542849c6e8358498fed81/models/best_entity_lm.ckpt"
+#     remote_path="s3://experiment-logging/storage/ner-pretraining/NER-LM.0b6dc1f3db3f41e1ad9c3db53bbd1b31/models/best_entity_lm.ckpt "
 #     )
-# trained_model_path = "best_entity_lm.ckpt"
 
-model = NERLongformerQA(args)
-#model = NERLongformerQA.load_from_checkpoint(trained_model_path, params = args)
+#trained_model_path = "best_entity_lm.ckpt"
+model = LongformerEncoder(args)
+#model = NERLED.load_from_checkpoint(trained_model_path, params = args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback])
-trainer.fit(model)
+#trainer.fit(model)
 results = trainer.test(model)
+print(results)
+

@@ -80,10 +80,11 @@ role_map = {
 
 #########################################################################################################################################
 def convert_templates_to_prompts(templates, tokenizer):
-    templates = [["{} are {}".format(key, doc[key]) for idx, key in enumerate(doc.keys()) if idx==0] for doc in templates]
+    input_template = ["The <arg> from <arg> used a <arg> to attack <arg> injuring <arg>"  for doc in templates]
+    filled_templates = ["{} from {} used {} to attack {} harming {}".format(doc["perpetrator individuals"], doc["perpetrator organizations"], doc["weapons"], doc["targets"], doc["victims"]) for doc in templates]
     #templates = [["{} {}".format(doc[key], key) for idx, key in enumerate(doc.keys()) if idx==0] for doc in templates]
-    templates = ["{}".format(str(tokenizer.sep_token).join(doc)) for doc in templates]
-    return templates
+    #templates = ["{}".format(str(tokenizer.sep_token).join(doc)) for doc in templates]
+    return input_template, filled_templates
 
 class NERDataset(Dataset):
     # doc_list
@@ -92,28 +93,17 @@ class NERDataset(Dataset):
         self.tokenizer = tokenizer
         self.docs = [doc["doctext"] for doc in dataset]
         # take only 1st mention of each role
-        first_mention_extracts = [{role_map[key].lower(): doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else '' for key in doc["extracts"].keys()} for doc in dataset]
+        first_mention_extracts = [{role_map[key].lower(): doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else "<ent>" for key in doc["extracts"].keys()} for doc in dataset]
         
-        #import ipdb; ipdb.set_trace()
-        first_mention_position = [{role_map[key].lower(): (doc["extracts"][key][0][0][1], doc["extracts"][key][0][0][1]+len(doc["extracts"][key][0][0][0])) if len(doc["extracts"][key])>0 else '' for key in doc["extracts"].keys()} for doc in dataset]
-
         # convert extracts to prompt template
-        self.train_templates = convert_templates_to_prompts(first_mention_extracts, tokenizer)
-        #self.encodings = self.tokenizer(self.docs, padding=True, truncation=True, max_length=1024, return_tensors="pt")
-
-        max_length = args.max_input_len
-        tgt_max_length = args.max_output_len
-        input_ids = [self.tokenizer.encode(doc) for doc in self.docs]
-        input_ids = torch.stack([torch.tensor(tokens+(max_length-len(tokens))*[self.tokenizer.pad_token_id]) if len(tokens)<max_length else torch.tensor(tokens[:max_length]) for tokens in input_ids])
-
-        self.encodings = {
-            "input_ids": input_ids, 
-            "attention_mask": ~(input_ids == self.tokenizer.pad_token_id)
-        }
-        #import ipdb; ipdb.set_trace()
-        self.labels = [self.tokenizer.encode(template) for template in self.train_templates]
-        self.labels = torch.stack([torch.tensor(tokens+(tgt_max_length-len(tokens))*[self.tokenizer.pad_token_id]) if len(tokens)<tgt_max_length else torch.tensor(tokens[:max_length]) for tokens in self.labels])
-
+        self.input_template, self.filled_templates = convert_templates_to_prompts(first_mention_extracts, tokenizer)
+        
+        self.encodings = self.tokenizer(self.input_template, self.docs, padding="max_length", truncation=True, max_length=args.max_input_len, return_tensors="pt")
+        
+        self.decoder_encodings = self.tokenizer(self.input_template, padding="max_length", truncation=True, max_length=args.max_output_len, return_tensors="pt")
+        
+        # self.labels = self.tokenizer(self.filled_templates, padding="max_length", truncation=True, max_length=args.max_output_len, return_tensors="pt")
+        # import ipdb; ipdb.set_trace()
 
     def __len__(self):
         """Returns length of the dataset"""
@@ -122,9 +112,9 @@ class NERDataset(Dataset):
     def __getitem__(self, idx):
         """Gets an example from the dataset. The input and output are tokenized and limited to a certain seqlen."""
         item = {key: val[idx] for key, val in self.encodings.items()}
-        item['labels'] = self.labels[idx]
-        item['decoder_input_ids'] = self.labels[idx]
-        item['decoder_mask'] = ~(self.labels[idx] == self.tokenizer.pad_token_id)
+        # item['labels'] = self.labels["input_ids"][idx]
+        item['decoder_input_ids'] = self.decoder_encodings["input_ids"][idx]
+        item['decoder_mask'] = ~self.decoder_encodings["attention_mask"][idx]
         return item
 
     @staticmethod
@@ -140,14 +130,14 @@ class NERDataset(Dataset):
 
         input_ids = torch.stack([ex['input_ids'] for ex in batch]) 
         attention_mask = torch.stack([ex['attention_mask'] for ex in batch]) 
-        labels = torch.stack([ex['labels'] for ex in batch]) 
+        # labels = torch.stack([ex['labels'] for ex in batch]) 
         decoder_input_ids = torch.stack([ex['decoder_input_ids'] for ex in batch]) 
         decoder_mask = torch.stack([ex['decoder_mask'] for ex in batch]) 
         
         return {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
-            'labels': labels,
+            # 'labels': labels,
             'decoder_input_ids': decoder_input_ids,
             'decoder_mask': decoder_mask 
         }
@@ -158,7 +148,7 @@ class NERDataset(Dataset):
 #import ipdb; ipdb.set_trace()
 
 ####################################################################################################################
-from transformers import LEDTokenizer, LEDForConditionalGeneration, LEDForQuestionAnswering
+from transformers import LEDTokenizer, LEDModel #LEDForConditionalGeneration, LEDForQuestionAnswering
 
 class NERLED(pl.LightningModule):
     """Pytorch Lightning module. It wraps up the model, data loading and training code"""
@@ -173,11 +163,16 @@ class NERLED(pl.LightningModule):
         self.config = AutoConfig.from_pretrained('allenai/led-base-16384')
         self.config.gradient_checkpointing = True
 
-        self.model = LEDForConditionalGeneration.from_pretrained("allenai/led-base-16384", config=self.config)
-
         # Load tokenizer and metric
         self.tokenizer = LEDTokenizer.from_pretrained('allenai/led-base-16384', use_fast=True)
+        self.tokenizer.add_tokens(['<ent>'])
+        self.vocab_size = len(self.tokenizer) 
         self.scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
+
+        #self.model = LEDForConditionalGeneration.from_pretrained("allenai/led-base-16384", config=self.config)
+        self.model = LEDModel.from_pretrained("allenai/led-base-16384", config=self.config)
+        self.model.resize_token_embeddings() 
+        
 
     def _set_global_attention_mask(self, input_ids):
         """Configure the global attention pattern based on the task"""
@@ -206,49 +201,95 @@ class NERLED(pl.LightningModule):
 
         return global_attention_mask
 
+    def resize_token_embeddings(self):
+        old_num_tokens = self.model.shared.num_embeddings
+        new_embeddings = self.model.resize_token_embeddings(len(self.tokenizer))
+        self.model.shared = new_embeddings
+        self.vocab_size = len(self.tokenizer) 
+        return new_embeddings
+
+    def convert_pointer_logits_to_lm_logits(self, pointer_logits, input_ids):
+        '''
+        pointer_logits: (batch, seq_len, input_seq_len)
+        input_ids: (batch, input_seq_len)
+        lm_logits: (batch, seq_len, vocab_size)
+        '''
+        batch_size = pointer_logits.size(0)
+        seq_len = pointer_logits.size(1)
+        input_seq_len = input_ids.size(1)
+        lm_logits = torch.full((batch_size, seq_len, self.vocab_size), fill_value=-1000,dtype=pointer_logits.dtype).to(pointer_logits.device)
+        
+        #  scatter may be technically incorrect for duplicate indexes, but not using it gets slow 
+        index = input_ids.unsqueeze(dim=1).expand_as(pointer_logits)
+        lm_logits.scatter_(dim=2, index=index, src=pointer_logits)
+        
+        return lm_logits 
+
+    def get_output_embeddings(self):
+        # this method is needed for generation
+        vocab_size, emb_size = self.model.shared.weight.shape
+        lin_layer = nn.Linear(vocab_size, emb_size, bias=False)
+        lin_layer.weight.data = self.model.shared.weight.data
+        return lin_layer 
+
     def forward(self, **batch):
         """Call LEDForConditionalGeneration.forward"""
         
         input_ids, attention_mask, decoder_input_ids, decoder_mask  = batch["input_ids"], batch["attention_mask"], batch["decoder_input_ids"], batch["decoder_mask"]
+        y_ids = decoder_input_ids[:, :-1] 
+        labels = decoder_input_ids[:, 1:].clone() 
+        labels[labels== self.tokenizer.pad_token_id] = -100 
 
-        if "labels" in batch.keys():
-            labels = batch["labels"]
-        else:
-            labels = None
-
-        outputs = self.model(input_ids=input_ids,
-                    decoder_input_ids=decoder_input_ids,
+        outputs = self.model(
+                    input_ids=input_ids,
+                    decoder_input_ids=y_ids,
                     attention_mask=attention_mask,  # mask padding tokens
                     global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
-                    labels=labels,
-                    use_cache=False)
+                    # labels=labels,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    return_dict=True
+                    )
 
-        # import ipdb; ipdb.set_trace()
+        decoder_last_hidden_state = outputs.decoder_hidden_states[-1] #([1, 64, 768])
+        #encoder_last_hidden_state = outputs.encoder_last_hidden_state #([1, 1024, 768])
+        input_embeds = self.model.encoder.embed_tokens(input_ids) #([1, 1024, 768])
+        pointer_logits = torch.einsum('ijk,ilk->ijl', decoder_last_hidden_state, input_embeds) #(batch, seq_len, input_seq_len) ([1, 64, 1024])
+        lm_logits = self.convert_pointer_logits_to_lm_logits(pointer_logits, input_ids)
+        outputs = (lm_logits,) + outputs[1:]
 
-        logits = outputs.logits
-
-        if "labels" in batch.keys():
-            labels = batch["labels"]
-            #Specify loss function
-            loss_fct = nn.CrossEntropyLoss()
-            # Only keep active parts of the loss
-            active_loss = decoder_mask.view(-1) == 1 # Convert to a single dimension where True if equals 1 and 0 if not
-            active_logits = logits.view(-1, self.tokenizer.vocab_size) # Collapse batch to single dimension 
-            active_labels = torch.where(
-                active_loss, labels.view(-1), torch.tensor(loss_fct.ignore_index).type_as(labels)
-            ) # if is in active loss, collapse batch of labels to single dimension else replace with the ignore ignore index from loss function
+        masked_lm_loss = None
             
-            loss = loss_fct(active_logits, active_labels)
-            outputs = (loss,) + (logits,)
-        else:
-            sample_vocab = torch.unique(input_ids)
-            reduced_logits = torch.index_select(logits, -1, sample_vocab)
-            outputs = (reduced_logits,)
+        if "train" in batch.keys():
+            loss_fct = nn.CrossEntropyLoss()
+            masked_lm_loss = loss_fct(lm_logits.view(-1, self.vocab_size), labels.view(-1))
+        
+        outputs = (masked_lm_loss,) + outputs
+
+        # logits = outputs.logits
+        # if "labels" in batch.keys():
+        #     labels = batch["labels"]
+        #     #Specify loss function
+        #     loss_fct = nn.CrossEntropyLoss()
+        #     # Only keep active parts of the loss
+        #     active_loss = decoder_mask.view(-1) == 1 # Convert to a single dimension where True if equals 1 and 0 if not
+        #     active_logits = logits.view(-1, self.tokenizer.vocab_size) # Collapse batch to single dimension 
+        #     active_labels = torch.where(
+        #         active_loss, labels.view(-1), torch.tensor(loss_fct.ignore_index).type_as(labels)
+        #     ) # if is in active loss, collapse batch of labels to single dimension else replace with the ignore ignore index from loss function
+            
+        #     loss = loss_fct(active_logits, active_labels)
+        #     outputs = (loss,) + (logits,)
+        # else:
+        #     sample_vocab = torch.unique(input_ids)
+        #     reduced_logits = torch.index_select(logits, -1, sample_vocab)
+        #     outputs = (reduced_logits,)
 
         return outputs
 
     def training_step(self, batch, batch_nb):
         """Call the forward pass then return loss"""
+        batch = {**batch, "train": True}
         outputs = self.forward(**batch)
         return {'loss': outputs[0]}
 
@@ -270,14 +311,11 @@ class NERLED(pl.LightningModule):
     def test_dataloader(self):
         return self._get_dataloader('test', is_train=False)
 
-    def generate(self, **kwargs):
-        return self.model.generate(**kwargs)
-
     def _evaluation_step(self, split, batch, batch_nb):
         """Validaton or Testing - predict output, compare it with gold, compute rouge1, 2, L, and log result"""
 
-        labels = batch.pop("labels", None)
-        gold = self.tokenizer.batch_decode(labels.tolist())                
+        #labels = batch.pop("labels", None)
+        gold = self.tokenizer.batch_decode(batch["decoder_input_ids"].tolist())                
 
         # batch_size = batch["input_ids"].size()[0]
         # prompt = self.tokenizer("The perpetrator individuals are", return_tensors="pt")["input_ids"].repeat(batch_size, 1).to(self.device)
@@ -285,35 +323,33 @@ class NERLED(pl.LightningModule):
 
         predictions = self.generate(
             input_ids=batch["input_ids"], 
-            decoder_start_token_id=self.tokenizer.cls_token_id, 
             num_beams=10, 
             max_length=self.args.max_output_len, 
             early_stopping=True, 
             repetition_penalty=1.3, 
             num_return_sequences=1)
 
-        # # Convert predicted and gold token ids to strings
+        # Convert predicted and gold token ids to strings
         predictions = self.tokenizer.batch_decode(predictions.tolist())
-        scores = self.scorer.score(' '.join(predictions),
+        rouge_scores = self.scorer.score(' '.join(predictions),
                             ' '.join(gold))
 
-        logs = {
-            "rouge": scores
-        }
-
         print("preds: ", predictions)
-        print("rouge: ", logs["rouge"])
-            
+        print("rouge: ", rouge_scores)
         return {"predictions": predictions}
 
-    # def test_epoch_end(self, outputs):
-    #     return {"preds": outputs}
+    def test_epoch_end(self, outputs):
+        results = []
+        for x in outputs:
+            results.append(x["predictions"])
+        return {"results": results}
 
     def validation_step(self, batch, batch_nb):
         self._evaluation_step('val', batch, batch_nb)
 
     def test_step(self, batch, batch_nb):
-        self._evaluation_step('test', batch, batch_nb)
+        preds = self._evaluation_step('test', batch, batch_nb)
+        return {"predictions": preds["predictions"]}
 
     def configure_optimizers(self):
         """Configure the optimizer and the learning rate scheduler"""
@@ -325,7 +361,7 @@ class NERLED(pl.LightningModule):
         #         parameters.requires_grad=True
 
         optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
-        return [optimizer]
+        return [optimizer]    
 
     @staticmethod
     def add_model_specific_args(parser):
