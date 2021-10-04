@@ -4,12 +4,9 @@ import json, os
 
 config = {
 "seed": 1234, 
-"lr": 1e-04, 
+"lr": 3e-05, 
 "warmup": 1000, 
 "num_workers": 4, 
-"limit_val_batches": 0.005, 
-"limit_test_batches": 0.005, 
-"limit_train_batches": 0.002, 
 "max_output_len": 64, 
 "data_dir": "/data",
 "output_dir": "./saved_models/test", 
@@ -17,16 +14,22 @@ config = {
 "max_input_len": 1024, 
 "batch_size": 1, 
 "eval_batch_size": 2, 
-"grad_accum": 1, 
+"accumulate_grad_batches": 1, 
 "fp16": False, 
-"grad_ckpt": False, 
+"grad_ckpt": True, 
 "attention_window": 256,
-"num_epochs": 20,
+"num_epochs": 10,
+"max_step": -1,
+"weight_decay": 0.0,
+"adam_epsilon": 1e-8,
+"gradient_clip_val": 1.0,
+"warmup_steps": 0,
+"model_name": 'allenai/led-base-16384' #'facebook/bart-large' #'allenai/led-base-16384'
 }
 args = argparse.Namespace(**config)
 
 Task.add_requirements('transformers', package_version='4.2.0')
-task = Task.init(project_name='LangGen', task_name='promptNER-fixedwords-bart', output_uri="s3://experiment-logging/storage/")
+task = Task.init(project_name='LangGen', task_name='promptNER-fixedwords-led', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
 task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
@@ -85,7 +88,8 @@ from torch import nn
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset
 from rouge_score import rouge_scorer
-#from led_model import LEDConstrainedGen
+from transformers import AutoTokenizer, LEDModel, AutoConfig, get_linear_schedule_with_warmup 
+from led_model import LEDConstrainedGen
 from bart_gen import BartConstrainedGen
 
 role_map = {
@@ -152,8 +156,6 @@ class NERDataset(Dataset):
         }
 
 ####################################################################################################################
-from transformers import AutoTokenizer, LEDModel, AutoConfig, get_linear_schedule_with_warmup 
-
 class NERLED(pl.LightningModule):
     """Pytorch Lightning module. It wraps up the model, data loading and training code"""
     def __init__(self, params):
@@ -163,18 +165,19 @@ class NERLED(pl.LightningModule):
         self.args = params
         self.dataset = muc4
 
-        model_name = 'facebook/bart-large' #'allenai/led-base-16384'
-
         # Load and update config then load a pretrained LEDForConditionalGeneration
-        self.config = AutoConfig.from_pretrained(model_name)
+        self.config = AutoConfig.from_pretrained(self.args.model_name)
         # Load tokenizer and metric
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.args.model_name, use_fast=True)
         self.tokenizer.add_tokens(['<ent>'])
         self.vocab_size = len(self.tokenizer) 
         self.scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
 
-        #self.model = LEDConstrainedGen(self.config, self.tokenizer)
-        self.model = BartConstrainedGen(self.config, self.tokenizer)
+        if self.args.model_name == "allenai/led-base-16384":
+            self.model = LEDConstrainedGen(self.config, self.tokenizer)
+        elif self.args.model_name == "facebook/bart-large":
+            self.model = BartConstrainedGen(self.config, self.tokenizer)
+
         self.model.resize_token_embeddings() 
         
     def training_step(self, batch, batch_nb):
@@ -274,45 +277,44 @@ class NERLED(pl.LightningModule):
 
         return {} 
 
-    def configure_optimizers(self):
-        """Configure the optimizer and the learning rate scheduler"""
-        # Freeze the model
-        # for idx, (name, parameters) in enumerate(self.model.named_parameters()):
-        #     if idx<6:
-        #         parameters.requires_grad=False
-        #     else:
-        #         parameters.requires_grad=True
-
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.args.lr)
-        return [optimizer]    
-
     # def configure_optimizers(self):
-    #     self.train_len = len(self.train_dataloader())
-    #     if self.args.max_steps > 0:
-    #         t_total = self.args.max_steps
-    #         self.args.num_train_epochs = self.args.max_steps // self.train_len // self.args.accumulate_grad_batches + 1
-    #     else:
-    #         t_total = self.train_len // self.args.accumulate_grad_batches * self.args.num_train_epochs
-        
-    #     # Prepare optimizer and schedule (linear warmup and decay)
-    #     no_decay = ["bias", "LayerNorm.weight"]
-    #     optimizer_grouped_parameters = [
-    #         {
-    #             "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)],
-    #             "weight_decay": self.args.weight_decay,
-    #         },
-    #         {"params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
-    #     ]
-    #     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
-    #     # scheduler is called only once per epoch by default 
-    #     scheduler =  get_linear_schedule_with_warmup(optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=t_total)
-    #     scheduler_dict = {
-    #         'scheduler': scheduler,
-    #         'interval': 'step',
-    #         'name': 'linear-schedule',
-    #     }
+    #     """Configure the optimizer and the learning rate scheduler"""
+    #     # Freeze the model
+    #     # for idx, (name, parameters) in enumerate(self.model.named_parameters()):
+    #     #     if idx<6:
+    #     #         parameters.requires_grad=False
+    #     #     else:
+    #     #         parameters.requires_grad=True
 
-    #     return [optimizer, ], [scheduler_dict,]
+    #     optimizer = torch.optim.AdamW(self.parameters(), lr=self.args.lr)
+    #     return [optimizer]    
+
+    def configure_optimizers(self):
+        self.train_len = len(self.train_dataloader())
+        if self.args.max_steps > 0:
+            t_total = self.args.max_steps
+            self.args.num_epochs = self.args.max_steps // self.train_len // self.args.accumulate_grad_batches + 1
+        else:
+            t_total = self.train_len // self.args.accumulate_grad_batches * self.args.num_train_epochs
+        
+        # Prepare optimizer and schedule (linear warmup and decay)
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)],
+                "weight_decay": self.args.weight_decay,
+            },
+            {"params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
+        ]
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
+        # scheduler is called only once per epoch by default 
+        scheduler =  get_linear_schedule_with_warmup(optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=t_total)
+        scheduler_dict = {
+            'scheduler': scheduler,
+            'interval': 'step',
+            'name': 'linear-schedule',
+        }
+        return [optimizer, ], [scheduler_dict,]
 
 checkpoint_callback = pl.callbacks.ModelCheckpoint(
     dirpath = "./",

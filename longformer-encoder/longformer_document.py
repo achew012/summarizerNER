@@ -83,20 +83,6 @@ class NERDataset(Dataset):
     # extracted_list as template
     def __init__(self, dataset, tokenizer, args):
         self.tokenizer = tokenizer
-        # first_mention_position = [{
-        #     "qns": [role_map[key].lower() for key in doc["extracts"].keys()], 
-        #     "context": [doc["doctext"] for key in doc["extracts"].keys()], 
-        #     "start": [doc["extracts"][key][0][0][1] if len(doc["extracts"][key])>0 else None for key in doc["extracts"].keys()], 
-        #     "end": [doc["extracts"][key][0][0][1]+len(doc["extracts"][key][0][0][0]) if len(doc["extracts"][key])>0 else None for key in doc["extracts"].keys()]
-        #     } for doc in dataset]
-
-        self.first_mention_position = {
-            "qns": ["who are the {} entities?".format(role_map[key].lower()) for doc in dataset for key in doc["extracts"].keys()], 
-            "context": [doc["doctext"] for doc in dataset for key in doc["extracts"].keys()],
-            # Add 3 in the indices to factor in <s>...</s></s>... 
-            "start": [doc["extracts"][key][0][0][1]+3 if len(doc["extracts"][key])>0 else 0 for doc in dataset for key in doc["extracts"].keys()], 
-            "end": [doc["extracts"][key][0][0][1]+len(self.tokenizer.encode(doc["extracts"][key][0][0][0]))+3 if len(doc["extracts"][key])>0 else 0 for doc in dataset for key in doc["extracts"].keys()]
-            }
 
         self.context = tokenizer(self.first_mention_position["qns"], self.first_mention_position["context"], padding=True, truncation=True, max_length=1024, return_tensors="pt")
 

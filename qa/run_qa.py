@@ -42,9 +42,9 @@ args = argparse.Namespace(**config)
 task = Task.init(project_name='LangGen', task_name='promptNER-QA-train', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
-# task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
-# task.connect(args)
-# task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+task.connect(args)
+task.execute_remotely(queue_name="128RAMv100", exit_process=True)
 
 class bucket_ops:
     StorageManager.set_cache_file_limit(5, cache_context=None)
@@ -117,49 +117,79 @@ class NERDataset(Dataset):
     # extracted_list as template
     def __init__(self, dataset, tokenizer, args):
         self.tokenizer = tokenizer
-        self.first_mention_position = {
-            "docid": [doc["docid"] for doc in dataset for key in doc["extracts"].keys()],
-            "qns": ["who are the {} entities?".format(role_map[key].lower()) for doc in dataset for key in doc["extracts"].keys()], 
-            "context": [doc["doctext"] for doc in dataset for key in doc["extracts"].keys()],
-            }
 
-        self.context = tokenizer(self.first_mention_position["qns"], self.first_mention_position["context"], padding=True, truncation=True, max_length=1024,     return_offsets_mapping=True, return_tensors="pt")
-        self.offsets = [[idx for idx, token in enumerate(tokens[:100]) if (idx!=0 and token[0]==0 and token[1]==0)] for tokens in self.context["offset_mapping"]]
-        
-        self.first_mention_position["start"]=[]
-        self.first_mention_position["end"]=[]
+        self.processed_dataset = {
+            "docid": [],
+            "context": [],
+            "input_ids": [],
+            "attention_mask": [],
+            "qns": [],
+            "gold_mentions": [],
+            "start": [],
+            "end": []
+        }
 
-        idx=0
         for doc in dataset:
-            for key in doc["extracts"].keys():                
-                if len(doc["extracts"][key])>0: 
-                    qns_offset = self.offsets[idx][1]
-                    mention_tokens = self.tokenizer.encode(doc["extracts"][key][0][0][0])
-                    context_len = len(self.tokenizer.encode(doc["doctext"]))         
-                    if (start_index+len(mention_tokens))<context_len:
-                        start_index = doc["extracts"][key][0][0][1] + qns_offset
-                        end_index = start_index+len(mention_tokens)+ qns_offset
-                    else:
-                        start_index=0
-                        end_index=0
+            docid = doc["docid"]
+            context = doc["doctext"] #self.tokenizer.decode(self.tokenizer.encode(doc["doctext"]))
+            qns_ans = [["who are the {} entities?".format(role_map[key].lower()), doc["extracts"][key][0][0][1] if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][1]+len(doc["extracts"][key][0][0][0]) if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else ""] for key in doc["extracts"].keys()]    
+
+            for qns, ans_char_start, ans_char_end, mention in qns_ans:
+                context_encodings = self.tokenizer(qns, context, padding="max_length", truncation=True, max_length=1024, return_offsets_mapping=True, return_tensors="pt")
+                sequence_ids = context_encodings.sequence_ids()
+
+                # Detect if the answer is out of the span (in which case this feature is labeled with the CLS index).
+                qns_offset = sequence_ids.index(1)-1
+                pad_start_idx = sequence_ids[sequence_ids.index(1):].index(None)
+                offsets_wo_pad = context_encodings["offset_mapping"][0][qns_offset:pad_start_idx]
+
+                if ans_char_end>offsets_wo_pad[-1][1] or ans_char_start>offsets_wo_pad[-1][1]:
+                    ans_char_start = 0
+                    ans_char_end = 0
+
+                if ans_char_start==0 and ans_char_end==0:
+                    token_span=[0,0]
                 else:
-                    start_index=0
-                    end_index=0
-                self.first_mention_position["start"].append(start_index)
-                self.first_mention_position["end"].append(end_index)
-                idx+=1
+                    token_span=[]
+                    for idx, span in enumerate(offsets_wo_pad):
+                        if ans_char_start>=span[0] and ans_char_start<=span[1] and len(token_span)==0:
+                            token_span.append(idx) 
+
+                        if ans_char_end>=span[0] and ans_char_end<=span[1] and len(token_span)==1:
+                            token_span.append(idx)
+                            break                        
+                
+                # If token span is incomplete
+                if len(token_span)<2:
+                    import ipdb; ipdb.set_trace()
+
+                # print("span: ", tokenizer.decode(context_encodings["input_ids"][0][token_span[0]+qns_offset:token_span[1]+1+qns_offset]))
+                # print("mention: ", mention)
+
+                self.processed_dataset["docid"].append(docid)
+                self.processed_dataset["context"].append(context)
+                self.processed_dataset["input_ids"].append(context_encodings["input_ids"].squeeze(0))
+                self.processed_dataset["attention_mask"].append(context_encodings["attention_mask"].squeeze(0))
+                self.processed_dataset["qns"].append(docid)
+                self.processed_dataset["gold_mentions"].append(mention)
+                self.processed_dataset["start"].append(token_span[0]+qns_offset)
+                self.processed_dataset["end"].append(token_span[1]+qns_offset+1)
 
 
     def __len__(self):
         """Returns length of the dataset"""
-        return len(self.first_mention_position["context"])
+        return len(self.processed_dataset["docid"])
 
     def __getitem__(self, idx):
         """Gets an example from the dataset. The input and output are tokenized and limited to a certain seqlen."""
-        item = {key: val[idx] for key, val in self.context.items()}
-        item['docid'] = self.first_mention_position["docid"][idx]
-        item['start'] = torch.tensor(self.first_mention_position["start"])[idx]
-        item['end'] = torch.tensor(self.first_mention_position["end"])[idx]
+        #item = {key: val[idx] for key, val in self.processed_dataset["encodings"].items()}
+        item={}
+        item['input_ids'] = self.processed_dataset["input_ids"][idx]
+        item['attention_mask'] = self.processed_dataset["attention_mask"][idx]
+        item['docid'] = self.processed_dataset["docid"][idx]
+        item['gold_mentions'] = self.processed_dataset["gold_mentions"][idx]
+        item['start'] = torch.tensor(self.processed_dataset["start"])[idx]
+        item['end'] = torch.tensor(self.processed_dataset["end"])[idx]
         return item
 
     @staticmethod
@@ -170,6 +200,7 @@ class NERDataset(Dataset):
         """
 
         docids = [ex['docid'] for ex in batch]
+        gold_mentions = [ex['gold_mentions'] for ex in batch]
         input_ids = torch.stack([ex['input_ids'] for ex in batch]) 
         attention_mask = torch.stack([ex['attention_mask'] for ex in batch]) 
         start = torch.stack([ex['start'] for ex in batch]) 
@@ -177,6 +208,7 @@ class NERDataset(Dataset):
         
         return {
             'docid': docids,
+            'gold_mentions': gold_mentions,
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'start_positions': start,
@@ -196,11 +228,11 @@ class NERLongformerQA(pl.LightningModule):
         self.dataset = muc4
 
         # Load and update config then load a pretrained LEDForConditionalGeneration
-        self.config = AutoConfig.from_pretrained("valhalla/longformer-base-4096-finetuned-squadv1")
+        self.config = AutoConfig.from_pretrained("mrm8488/longformer-base-4096-finetuned-squadv2")
         self.config.gradient_checkpointing = True
-        self.model = AutoModelForQuestionAnswering.from_pretrained("valhalla/longformer-base-4096-finetuned-squadv1", config=self.config)
+        self.model = AutoModelForQuestionAnswering.from_pretrained("mrm8488/longformer-base-4096-finetuned-squadv2", config=self.config)
         # Load tokenizer and metric
-        self.tokenizer = AutoTokenizer.from_pretrained("valhalla/longformer-base-4096-finetuned-squadv1", use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained("mrm8488/longformer-base-4096-finetuned-squadv2", use_fast=True)
 
     def _set_global_attention_mask(self, input_ids):
         """Configure the global attention pattern based on the task"""
@@ -253,6 +285,9 @@ class NERLongformerQA(pl.LightningModule):
 
     def training_step(self, batch, batch_nb):
         """Call the forward pass then return loss"""
+        docids = batch.pop("docid", None)
+        gold_mentions = batch.pop("gold_mentions", None)
+
         outputs = self.forward(**batch)
         return {'loss': outputs.loss}
 
@@ -279,12 +314,12 @@ class NERLongformerQA(pl.LightningModule):
 
     def _evaluation_step(self, split, batch, batch_nb):
         """Validaton or Testing - predict output, compare it with gold, compute rouge1, 2, L, and log result"""
-
+        
         # input_ids, attention_mask, start, end  = batch["input_ids"], batch["attention_mask"], batch["start_positions"], batch["end_positions"]
 
-        # start = batch.pop("start_positions")
-        # end = batch.pop("end_positions")
-
+        docids = batch.pop("docid", None)
+        gold_mentions = batch.pop("gold_mentions", None)
+        
         outputs = self(**batch)  # mask padding tokens        
         candidates_start_batch = torch.topk(outputs.start_logits, 20)
         candidates_end_batch = torch.topk(outputs.end_logits, 20)
@@ -297,7 +332,7 @@ class NERLongformerQA(pl.LightningModule):
         batch_outputs = []
 
         #For each sample in batch
-        for start_candidates, start_candidates_logits, end_candidates, end_candidates_logits, tokens, question_indices, start_gold, end_gold, attention_mask in zip(candidates_start_batch.indices, candidates_start_batch.values, candidates_end_batch.indices, candidates_end_batch.values, batch["input_ids"], question_indices_batch, batch["start_positions"], batch["end_positions"], batch["attention_mask"]):
+        for start_candidates, start_candidates_logits, end_candidates, end_candidates_logits, tokens, question_indices, start_gold, end_gold, attention_mask, docid, gold_mention in zip(candidates_start_batch.indices, candidates_start_batch.values, candidates_end_batch.indices, candidates_end_batch.values, batch["input_ids"], question_indices_batch, batch["start_positions"], batch["end_positions"], batch["attention_mask"], docids, gold_mentions):
 
             valid_candidates = []
             # For each candidate in sample
@@ -323,7 +358,10 @@ class NERLongformerQA(pl.LightningModule):
 
             batch_outputs.append(
                 {
-                    "context": self.tokenizer.decode(torch.masked_select(tokens, torch.gt(attention_mask, 0))), 
+                    "docid": docid,
+                    "qns": self.tokenizer.decode(tokens[1:len(question_indices)]),
+                    "gold_mention": gold_mention,
+                    "context": self.tokenizer.decode(torch.masked_select(tokens, torch.gt(attention_mask, 0))[1+len(question_indices):]), 
                     "start_gold": start_gold.item(),
                     "end_gold": end_gold.item(),
                     "gold": self.tokenizer.decode(tokens[start_gold:end_gold]),
@@ -345,16 +383,36 @@ class NERLongformerQA(pl.LightningModule):
         return {"results": out["preds"]}
 
     def test_epoch_end(self, outputs):
-        results = []
+
+        predictions = {}
+        for batch in outputs:
+            for sample in batch["results"]:
+                if sample["docid"] not in predictions.keys():
+                    predictions[sample["docid"]]={
+                        "docid": sample["docid"],
+                        "context": sample["context"],
+                        "qns": [sample["qns"]],
+                        "gold_mention": [sample["gold_mention"]],
+                        "gold": [sample["gold"]],
+                        "candidates": [sample["candidates"][:1]]
+                   }
+                else:
+                    predictions[sample["docid"]]["qns"].append(sample["qns"])
+                    predictions[sample["docid"]]["gold_mention"].append(sample["gold_mention"])
+                    predictions[sample["docid"]]["gold"].append(sample["gold"])
+                    predictions[sample["docid"]]["candidates"].append(sample["candidates"][:1])
+ 
+        results = [{**value} for key, value in predictions.items()]
+
+        # results = []
         # with open("predictions.txt", "w") as f:
-        #     for x in outputs:
         #         results.append(x["results"])
         #         f.write(str(x["results"])+'\n')
         #     f.close()
 
-        to_jsonl("predictions.jsonl", results)
+        to_jsonl("./predictions.jsonl", results)
 
-        task.upload_artifact(name='predictions', artifact_object="./predictions.jsonl")
+        #task.upload_artifact(name='predictions', artifact_object="./predictions.jsonl")
 
         return {"results": results}
 
@@ -367,7 +425,7 @@ class NERLongformerQA(pl.LightningModule):
         #     else:
         #         parameters.requires_grad=True
 
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.args.lr)
         return [optimizer]
 
     @staticmethod

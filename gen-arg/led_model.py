@@ -143,8 +143,6 @@ class LEDConstrainedGen(PreTrainedModel):
         #  scatter may be technically incorrect for duplicate indexes, but not using it gets slow 
         index = input_ids.unsqueeze(dim=1).expand_as(pointer_logits)
         lm_logits.scatter_(dim=2, index=index, src=pointer_logits)
-
-
         
         return lm_logits 
 
@@ -251,7 +249,9 @@ class LEDConstrainedGen(PreTrainedModel):
             lm_logits = self.convert_pointer_logits_to_lm_logits(pointer_logits, input_ids)
 
             outputs = (lm_logits,) + outputs[1:]  # Add cache, hidden states and attention if they are here
-            loss_fct = nn.CrossEntropyLoss()
+            loss_fct = nn.NLLLoss() #nn.CrossEntropyLoss()
+
+            import ipdb; ipdb.set_trace()
 
             masked_lm_loss = loss_fct(lm_logits.view(-1, self.vocab_size), labels.view(-1))
             outputs = (masked_lm_loss,) + outputs
