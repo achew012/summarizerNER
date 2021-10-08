@@ -19,7 +19,7 @@ config = {
 "grad_ckpt": True, 
 "attention_window": 256,
 "num_epochs": 10,
-"max_step": -1,
+"max_steps": -1,
 "weight_decay": 0.0,
 "adam_epsilon": 1e-8,
 "gradient_clip_val": 1.0,
@@ -32,9 +32,9 @@ Task.add_requirements('transformers', package_version='4.2.0')
 task = Task.init(project_name='LangGen', task_name='promptNER-fixedwords-led', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
-task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
-task.connect(args)
-task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+# task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+# task.connect(args)
+# task.execute_remotely(queue_name="128RAMv100", exit_process=True)
 
 class bucket_ops:
     StorageManager.set_cache_file_limit(5, cache_context=None)
@@ -295,7 +295,7 @@ class NERLED(pl.LightningModule):
             t_total = self.args.max_steps
             self.args.num_epochs = self.args.max_steps // self.train_len // self.args.accumulate_grad_batches + 1
         else:
-            t_total = self.train_len // self.args.accumulate_grad_batches * self.args.num_train_epochs
+            t_total = self.train_len // self.args.accumulate_grad_batches * self.args.num_epochs
         
         # Prepare optimizer and schedule (linear warmup and decay)
         no_decay = ["bias", "LayerNorm.weight"]
@@ -306,7 +306,7 @@ class NERLED(pl.LightningModule):
             },
             {"params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
         ]
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.args.lr, eps=self.args.adam_epsilon)
         # scheduler is called only once per epoch by default 
         scheduler =  get_linear_schedule_with_warmup(optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=t_total)
         scheduler_dict = {

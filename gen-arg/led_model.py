@@ -186,7 +186,7 @@ class LEDConstrainedGen(PreTrainedModel):
             global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
             return_dict=return_dict,)
 
-            
+
             decoder_output = outputs[0] #(batch, seq_len, hidden_dim)
             if encoder_outputs==None:
                 encoder_outputs = outputs[1] # (batch, input_seq_len, hidden_dim) 
@@ -195,9 +195,9 @@ class LEDConstrainedGen(PreTrainedModel):
             if input_embeds==None:
                 # get encoder side embeddings 
                 input_embeds = self.transformer.encoder.embed_tokens(input_ids) #* self.transformer.encoder.embed_scale #(batch, seq_len, input_seq_len)
+            
             pointer_logits = torch.einsum('ijk,ilk->ijl', decoder_output, input_embeds) #(batch, seq_len, input_seq_len)
             lm_logits = self.convert_pointer_logits_to_lm_logits(pointer_logits, input_ids)
-
             
             masked_lm_loss = None
             
@@ -251,14 +251,12 @@ class LEDConstrainedGen(PreTrainedModel):
             outputs = (lm_logits,) + outputs[1:]  # Add cache, hidden states and attention if they are here
             loss_fct = nn.NLLLoss() #nn.CrossEntropyLoss()
 
-            import ipdb; ipdb.set_trace()
+            #import ipdb; ipdb.set_trace()
 
             masked_lm_loss = loss_fct(lm_logits.view(-1, self.vocab_size), labels.view(-1))
             outputs = (masked_lm_loss,) + outputs
 
             return outputs
-
-    
 
 
     # # this is a simplified generate class for the pointer generator taken from https://github.com/huggingface/transformers/blob/v3.1.0/src/transformers/generation_utils.py
