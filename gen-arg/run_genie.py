@@ -1,10 +1,10 @@
 from clearml import Task, StorageManager, Dataset
 import argparse
-import json, os
+import json, os, ipdb
 
 config = {
 "seed": 1234, 
-"lr": 3e-05, 
+"lr": 5e-03, 
 "warmup": 1000, 
 "num_workers": 4, 
 "max_output_len": 64, 
@@ -13,7 +13,7 @@ config = {
 "val_every": 0.33, 
 "max_input_len": 1024, 
 "batch_size": 1, 
-"eval_batch_size": 2, 
+"eval_batch_size": 1, 
 "accumulate_grad_batches": 1, 
 "fp16": False, 
 "grad_ckpt": True, 
@@ -24,7 +24,8 @@ config = {
 "adam_epsilon": 1e-8,
 "gradient_clip_val": 1.0,
 "warmup_steps": 0,
-"model_name": 'allenai/led-base-16384' #'facebook/bart-large' #'allenai/led-base-16384'
+"model_name": 'allenai/led-base-16384',
+#"model_name": 'facebook/bart-large'
 }
 args = argparse.Namespace(**config)
 
@@ -336,5 +337,4 @@ model = NERLED(args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback])
 trainer.fit(model)
 results = trainer.test(model)
-print(results)
 

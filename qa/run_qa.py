@@ -2,6 +2,8 @@ from clearml import Task, StorageManager, Dataset
 import argparse
 import json, os
 import jsonlines
+import ipdb
+from collections import OrderedDict
 
 def read_json(jsonfile):
     with open(jsonfile, 'rb') as file:
@@ -27,21 +29,21 @@ config = {
 "output_dir": "./saved_models/test", 
 "val_every": 0.33, 
 "max_input_len": 2048, 
-"batch_size": 1, 
+"batch_size": 4, 
 "eval_batch_size": 4, 
 "grad_accum": 1, 
 "fp16": False, 
 "grad_ckpt": True, 
 "attention_window": 256,
 "num_epochs": 10,
-"use_entity_embeddings": True,
-#"model_name": "allenai/longformer-base-4096"
-"model_name": "mrm8488/longformer-base-4096-finetuned-squadv2"  
+"use_entity_embeddings": False,
+"model_name": "allenai/longformer-base-4096",
+#"model_name": "mrm8488/longformer-base-4096-finetuned-squadv2"  
+"debug": False
 }
 #json.load(open('config.json'))
 
 args = argparse.Namespace(**config)
-
 task = Task.init(project_name='LangGen', task_name='promptNER-QA-Base', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
@@ -96,6 +98,8 @@ muc4 = {
     "test": test_data
 }
 
+role_list = ["PerpInd", "PerpOrg", "Target", "Victim", "Weapon"]
+
 #############################################################################################
 
 import pytorch_lightning as pl
@@ -106,6 +110,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoConfig, AutoModelForSeq2SeqLM, set_seed, get_linear_schedule_with_warmup
 from seqeval.metrics import f1_score, precision_score, recall_score, accuracy_score
 from rouge_score import rouge_scorer
+from eval import eval_ceaf
 
 role_map = {
     'PerpOrg': 'perpetrator organizations', 
@@ -136,9 +141,11 @@ class NERDataset(Dataset):
         for doc in dataset:
             docid = doc["docid"]
             context = doc["doctext"] #self.tokenizer.decode(self.tokenizer.encode(doc["doctext"]))
-            #qns_ans = [["who are the {} entities?".format(role_map[key].lower()), doc["extracts"][key][0][0][1] if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][1]+len(doc["extracts"][key][0][0][0]) if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else ""] for key in doc["extracts"].keys()]    
 
-            qns_ans = [["who are the {} entities?".format(role_map[key].lower()), mention[1] if len(mention)>0 else 0, mention[1]+len(mention[0]) if len(mention)>0 else 0, mention[0] if len(mention)>0 else ""] for key in doc["extracts"].keys() for cluster in doc["extracts"][key] for mention in cluster]    
+            ### Only take the 1st label of each role
+            qns_ans = [["who are the {} entities?".format(role_map[key].lower()), doc["extracts"][key][0][0][1] if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][1]+len(doc["extracts"][key][0][0][0]) if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else ""] for key in doc["extracts"].keys()]    
+            ### expand on all labels in each role
+            #qns_ans = [["who are the {} entities?".format(role_map[key].lower()), mention[1] if len(mention)>0 else 0, mention[1]+len(mention[0]) if len(mention)>0 else 0, mention[0] if len(mention)>0 else ""] for key in doc["extracts"].keys() for cluster in doc["extracts"][key] for mention in cluster]    
 
             for qns, ans_char_start, ans_char_end, mention in qns_ans:
                 context_encodings = self.tokenizer(qns, context, padding="max_length", truncation=True, max_length=1024, return_offsets_mapping=True, return_tensors="pt")
@@ -261,9 +268,32 @@ def compute_f1(a_gold, a_pred):
     f1 = (2 * precision * recall) / (precision + recall)
     return f1
 
+def read_golds_from_test_file(data_dir, tokenizer):
+    golds = OrderedDict()
+    doctexts_tokens = OrderedDict()
+    file_path = os.path.join(data_dir, "test.json")
+    with open(file_path, encoding="utf-8") as f:
+        for line in f:
+            line = json.loads(line)
+            docid=line["docid"]
+            #docid = int(line["docid"].split("-")[0][-1])*10000 + int(line["docid"].split("-")[-1]) # transform TST1-MUC3-0001 to int(0001)
+            doctext, extracts_raw = line["doctext"], line["extracts"]
+
+            extracts = OrderedDict()
+            for role, entitys_raw in extracts_raw.items():
+                extracts[role] = []
+                for entity_raw in entitys_raw:
+                    entity = []
+                    for mention_offset_pair in entity_raw:
+                        entity.append(mention_offset_pair[0])
+                    if entity:
+                        extracts[role].append(entity)
+            doctexts_tokens[docid] = tokenizer.tokenize(doctext)
+            golds[docid] = extracts
+    return doctexts_tokens, golds
+
 ####################################################################################################################
 from transformers import AutoTokenizer, AutoModelForQuestionAnswering
-
 from pretrain import NERLongformer
 
 class NERLongformerQA(pl.LightningModule):
@@ -378,7 +408,11 @@ class NERLongformerQA(pl.LightningModule):
 
     def _get_dataloader(self, split_name, is_train):
         """Get training and validation dataloaders"""
-        dataset_split = self.dataset[split_name]
+        if self.args.debug:
+            dataset_split = self.dataset[split_name][:25]
+        else:
+            dataset_split = self.dataset[split_name]
+
         dataset = NERDataset(dataset=dataset_split, tokenizer=self.tokenizer, args=self.args)
         if split_name in ["val", "test"]:
             return DataLoader(dataset, batch_size=self.args.eval_batch_size, num_workers=self.args.num_workers, collate_fn=NERDataset.collate_fn)
@@ -461,42 +495,13 @@ class NERLongformerQA(pl.LightningModule):
 
     def validation_step(self, batch, batch_nb):
         out = self._evaluation_step('val', batch, batch_nb)
-        return {"results": out["preds"]}
+        return {"results": out["preds"], "loss": out["loss"]}
 
     def validation_epoch_end(self, outputs):
-        gold_list = NERDataset(dataset=self.dataset["test"], tokenizer=self.tokenizer, args=self.args).processed_dataset["gold_mentions"]       
-        pred_list = []
-
-        predictions = {}
+        total_loss = []
         for batch in outputs:
-            for sample in batch["results"]:          
-                pred_list.append(sample["candidates"][:1][0][2] if sample["candidates"][:1][0][2]!="</s>" else "")
-                if sample["docid"] not in predictions.keys():
-                    predictions[sample["docid"]]={
-                        "docid": sample["docid"],
-                        "context": sample["context"],
-                        "qns": [sample["qns"]],
-                        "gold_mention": [sample["gold_mention"]],
-                        "gold": [sample["gold"]],
-                        "candidates": [sample["candidates"][:1]]
-                   }
-                else:
-                    predictions[sample["docid"]]["qns"].append(sample["qns"])
-                    predictions[sample["docid"]]["gold_mention"].append(sample["gold_mention"])
-                    predictions[sample["docid"]]["gold"].append(sample["gold"])
-                    predictions[sample["docid"]]["candidates"].append(sample["candidates"][:1])
- 
-        results = [{**value} for key, value in predictions.items()]
-
-        f1_list = [compute_f1(gold, pred) for pred, gold in zip(pred_list, gold_list)]
-        mean_F1 = sum(f1_list)/len(f1_list)
-
-        EM_list = [compute_exact(gold, pred) for pred, gold in zip(pred_list, gold_list)]
-        mean_EM = sum(EM_list)/len(EM_list)
-
-        clearlogger.report_scalar(title='f1', series = 'val', value=mean_F1, iteration=1) 
-        clearlogger.report_scalar(title='EM', series = 'val', value=mean_EM, iteration=1) 
-        return {"f1": mean_F1, "EM": mean_EM}
+            total_loss.append(batch["loss"])
+        self.log("val_loss", sum(total_loss)/len(total_loss))
 
     def test_step(self, batch, batch_nb):
         out = self._evaluation_step('test', batch, batch_nb)
@@ -504,8 +509,14 @@ class NERLongformerQA(pl.LightningModule):
 
     #################################################################################
     def test_epoch_end(self, outputs):
-        gold_list = NERDataset(dataset=self.dataset["test"], tokenizer=self.tokenizer, args=self.args).processed_dataset["gold_mentions"]       
+        #gold_list = NERDataset(dataset=self.dataset["test"], tokenizer=self.tokenizer, args=self.args).processed_dataset["gold_mentions"]       
         pred_list = []
+
+        logs={}
+        doctexts_tokens, golds = read_golds_from_test_file(os.path.join(dataset_folder, "data/muc4-grit/processed/"), self.tokenizer)[:25]
+        
+        if self.args.debug:
+            golds = {key:golds[key] for idx, key in enumerate(golds.keys()) if idx<10}
 
         predictions = {}
         for batch in outputs:
@@ -526,16 +537,42 @@ class NERLongformerQA(pl.LightningModule):
                     predictions[sample["docid"]]["gold"].append(sample["gold"])
                     predictions[sample["docid"]]["candidates"].append(sample["candidates"][:1])
  
-        results = [{**value} for key, value in predictions.items()]
+        #raw_results = [{**value} for key, value in predictions.items()]
 
-        f1_list = [compute_f1(gold, pred) for pred, gold in zip(pred_list, gold_list)]
-        mean_F1 = sum(f1_list)/len(f1_list)
+        preds = OrderedDict()
+        for key, doc in predictions.items():
+            if key not in preds:
+                preds[key] = OrderedDict()
+                for idx, role in enumerate(role_list):
+                    preds[key][role] = []
+                    if idx+1 > len(doc["candidates"]): 
+                        continue
+                    elif doc["candidates"][idx]:
+                        if doc["candidates"][idx][0][2]=="</s>":
+                            continue
+                        else:    
+                            preds[key][role] = [[doc["candidates"][idx][0][2].replace("</s>", "")]]                
 
-        EM_list = [compute_exact(gold, pred) for pred, gold in zip(pred_list, gold_list)]
-        mean_EM = sum(EM_list)/len(EM_list)
+        results = eval_ceaf(preds, golds)
+        print("================= CEAF score =================")
+        print("phi_strict: P: {:.2f}%,  R: {:.2f}%, F1: {:.2f}%".format(results["strict"]["micro_avg"]["p"] * 100, results["strict"]["micro_avg"]["r"] * 100, results["strict"]["micro_avg"]["f1"] * 100))
+        print("phi_prop: P: {:.2f}%,  R: {:.2f}%, F1: {:.2f}%".format(results["prop"]["micro_avg"]["p"] * 100, results["prop"]["micro_avg"]["r"] * 100, results["prop"]["micro_avg"]["f1"] * 100))
+        print("==============================================")
+        logs["test_micro_avg_f1_phi_strict"] = results["strict"]["micro_avg"]["f1"]
+        logs["test_micro_avg_precision_phi_strict"] = results["strict"]["micro_avg"]["p"]
+        logs["test_micro_avg_recall_phi_strict"] = results["strict"]["micro_avg"]["r"]
+        clearlogger.report_scalar(title='f1', series = 'test', value=logs["test_micro_avg_f1_phi_strict"], iteration=1) 
+        clearlogger.report_scalar(title='precision', series = 'test', value=logs["test_micro_avg_precision_phi_strict"], iteration=1) 
+        clearlogger.report_scalar(title='recall', series = 'test', value=logs["test_micro_avg_recall_phi_strict"], iteration=1) 
 
-        clearlogger.report_scalar(title='f1', series = 'test', value=mean_F1, iteration=1) 
-        clearlogger.report_scalar(title='EM', series = 'test', value=mean_EM, iteration=1) 
+        # f1_list = [compute_f1(gold, pred) for pred, gold in zip(pred_list, gold_list)]
+        # mean_F1 = sum(f1_list)/len(f1_list)
+
+        # EM_list = [compute_exact(gold, pred) for pred, gold in zip(pred_list, gold_list)]
+        # mean_EM = sum(EM_list)/len(EM_list)
+
+        #clearlogger.report_scalar(title='f1', series = 'test', value=mean_F1, iteration=1) 
+        #clearlogger.report_scalar(title='EM', series = 'test', value=mean_EM, iteration=1) 
 
         to_jsonl("./predictions.jsonl", results)
         task.upload_artifact(name='predictions', artifact_object="./predictions.jsonl")
@@ -583,15 +620,19 @@ class NERLongformerQA(pl.LightningModule):
 checkpoint_callback = pl.callbacks.ModelCheckpoint(
     dirpath = "./",
     filename="best_ner_model", 
-    monitor="f1", 
-    mode="max", 
+    monitor="val_loss", 
+    mode="min", 
     save_top_k=1, 
     save_weights_only=True,
     period=5
 )
 
-model = NERLongformerQA(args)
-#model = NERLongformerQA.load_from_checkpoint(trained_model_path, params = args)
+trained_model_path = bucket_ops.get_file(
+            remote_path="s3://experiment-logging/storage/LangGen/promptNER-QA-Base.8a4f96a4f4d1411fbfd64a56a43f6644/models/best_ner_model.ckpt"
+            )
+
+#model = NERLongformerQA(args)
+model = NERLongformerQA.load_from_checkpoint(trained_model_path, params = args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback])
 trainer.fit(model)
 results = trainer.test(model)

@@ -11,17 +11,17 @@ from transformers.modeling_outputs import Seq2SeqLMOutput
 from transformers.generation_utils import top_k_top_p_filtering
 from typing import Iterable, List, Optional
 from transformers.file_utils import ModelOutput
-
+import ipdb
 
 class LEDConstrainedGen(PreTrainedModel):
     def __init__(self, config, tokenizer):
         super(LEDConstrainedGen, self).__init__(config)
         self.config = config 
         self.tokenizer = tokenizer 
-        self.transformer = LEDModel.from_pretrained("allenai/led-base-16384")
+        # self.transformer = LEDModel.from_pretrained("allenai/led-base-16384")
+        self.transformer = LEDModel.from_pretrained("allenai/led-base-16384", config=self.config)
         self.register_buffer("final_logits_bias", torch.zeros((1, self.transformer.shared.num_embeddings)))
 
-        self.model = LEDModel.from_pretrained("allenai/led-base-16384", config=self.config)
 
     def _set_global_attention_mask(self, input_ids):
         """Configure the global attention pattern based on the task"""
@@ -224,34 +224,34 @@ class LEDConstrainedGen(PreTrainedModel):
             labels = decoder_input_ids[:, 1:].clone() 
             labels[labels== self.tokenizer.pad_token_id] = -100 
             # labels are just decoder_input_ids shifted to the right by 1 
-            
+
             outputs = self.transformer(
             input_ids,
             attention_mask=attention_mask,
             decoder_input_ids=y_ids,
             use_cache=False, 
-            past_key_values=past_key_values,
+            #past_key_values=past_key_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             #global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
             return_dict=return_dict,)
             
-            decoder_output = outputs[0] #(batch, seq_len, hidden_dim)
-            encoder_output = outputs[1] # (batch, input_seq_len, hidden_dim)
+            #ipdb.set_trace()        
+
+            decoder_output = outputs.last_hidden_state #(batch, seq_len, hidden_dim)
+            encoder_output = outputs.encoder_hidden_states[-1] # (batch, input_seq_len, hidden_dim)
             # lm_logits = F.linear(decoder_output, self.transformer.shared.weight, bias=self.final_logits_bias)
             # lm_logits = self.remove_unseen(lm_logits, input_ids)
+            
             # get encoder side embeddings 
             input_embeds = self.transformer.encoder.embed_tokens(input_ids) #* self.transformer.encoder.embed_scale #(batch, seq_len, input_seq_len)
-
             pointer_logits = torch.einsum('ijk,ilk->ijl', decoder_output, input_embeds) #(batch, seq_len, input_seq_len)
             # decrease <arg> prob if neccesary 
-
             lm_logits = self.convert_pointer_logits_to_lm_logits(pointer_logits, input_ids)
 
             outputs = (lm_logits,) + outputs[1:]  # Add cache, hidden states and attention if they are here
-            loss_fct = nn.NLLLoss() #nn.CrossEntropyLoss()
-
-            #import ipdb; ipdb.set_trace()
+            loss_fct = nn.NLLLoss() 
+            #loss_fct = nn.CrossEntropyLoss() higher loss
 
             masked_lm_loss = loss_fct(lm_logits.view(-1, self.vocab_size), labels.view(-1))
             outputs = (masked_lm_loss,) + outputs
