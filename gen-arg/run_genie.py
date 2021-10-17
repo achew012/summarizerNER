@@ -18,14 +18,14 @@ config = {
 "fp16": False, 
 "grad_ckpt": True, 
 "attention_window": 256,
-"num_epochs": 5,
+"num_epochs": 1,
 "max_steps": -1,
 "weight_decay": 0.0,
 "adam_epsilon": 1e-8,
 "gradient_clip_val": 1.0,
 "warmup_steps": 0,
-"model_name": 'allenai/led-base-16384',
-#"model_name": 'facebook/bart-large'
+#"model_name": 'allenai/led-base-16384',
+"model_name": 'facebook/bart-large'
 }
 args = argparse.Namespace(**config)
 
@@ -33,9 +33,9 @@ Task.add_requirements('transformers', package_version='4.2.0')
 task = Task.init(project_name='LangGen', task_name='promptNER-fixedwords-led', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
-# task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
-# task.connect(args)
-# task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+task.connect(args)
+task.execute_remotely(queue_name="128RAMv100", exit_process=True)
 
 class bucket_ops:
     StorageManager.set_cache_file_limit(5, cache_context=None)
@@ -103,7 +103,7 @@ role_map = {
 
 #########################################################################################################################################
 def convert_templates_to_prompts(templates, tokenizer):
-    input_template = ["<PerpOrg><ent><PerpInd><ent><Victim><ent><Target><ent><Weapon><ent>" for doc in templates]
+    input_template = ["<PerpOrg><mask><PerpInd><mask><Victim><mask><Target><mask><Weapon><mask>" for doc in templates]
     filled_templates = ["<PerpInd>{}<PerpOrg>{}<Victim>{}<Target>{}<Weapon>{}".format(doc["<PerpInd>"], doc["<PerpOrg>"], doc["<Victim>"], doc["<Target>"], doc["<Weapon>"]) for doc in templates]
     return input_template, filled_templates
 
@@ -114,12 +114,11 @@ class NERDataset(Dataset):
         self.tokenizer = tokenizer
         self.docs = [doc["doctext"] for doc in dataset]
         # take only 1st mention of each role
-        first_mention_extracts = [{role_map[key]: doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else "<ent>" for key in doc["extracts"].keys()} for doc in dataset]
+        first_mention_extracts = [{role_map[key]: doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else "" for key in doc["extracts"].keys()} for doc in dataset]
         # convert extracts to prompt template
         self.input_template, self.filled_templates = convert_templates_to_prompts(first_mention_extracts, tokenizer)
         self.encodings = self.tokenizer(self.input_template, self.docs, padding="max_length", truncation=True, max_length=args.max_input_len, return_tensors="pt")        
         self.decoder_encodings = self.tokenizer(self.filled_templates, padding="max_length", truncation=True, max_length=args.max_output_len, return_tensors="pt")
-        #import ipdb; ipdb.set_trace()
 
     def __len__(self):
         """Returns length of the dataset"""
@@ -170,7 +169,7 @@ class NERLED(pl.LightningModule):
         self.config = AutoConfig.from_pretrained(self.args.model_name)
         # Load tokenizer and metric
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.model_name, use_fast=True)
-        self.tokenizer.add_tokens(['<ent>'])
+        #self.tokenizer.add_tokens(['<ent>'])
         self.tokenizer.add_tokens([value for key, value in role_map.items()])
 
         self.vocab_size = len(self.tokenizer) 
@@ -195,7 +194,7 @@ class NERLED(pl.LightningModule):
         outputs = self.model(**inputs)
 
         loss = outputs[0]
-        loss = torch.mean(loss)
+        #loss = torch.mean(loss)
 
         log = {
             'train/loss': loss, 
@@ -254,7 +253,7 @@ class NERLED(pl.LightningModule):
         # else:
 
         sample_output = self.model.generate(batch['input_token_ids'], do_sample=False, 
-                            max_length=self.args.max_output_len, num_return_sequences=1,num_beams=5,
+                            max_length=self.args.max_output_len, num_beams=1,
                         )
         
         sample_output = sample_output.reshape(batch['input_token_ids'].size(0), 1, -1)
@@ -322,19 +321,20 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
     dirpath = "./",
     filename="best_ner_model", 
     monitor="val_loss", 
-    mode="max", 
+    mode="min", 
     save_top_k=1, 
     save_weights_only=True,
     period=5
 )
 
 # trained_model_path = bucket_ops.get_file(
-#     remote_path="s3://experiment-logging/storage/ner-pretraining/NER-LM.0b6dc1f3db3f41e1ad9c3db53bbd1b31/models/best_entity_lm.ckpt "
+#     remote_path="s3://experiment-logging/storage/LangGen/promptNER-fixedwords-led.9884106e43884dcda03b8ab5e0e5b792/models/best_ner_model-v6.ckpt"
 #     )
 
 #trained_model_path = "best_entity_lm.ckpt"
 
 model = NERLED(args)
+#model = NERLED.load_from_checkpoint(trained_model_path, params = args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback])
 trainer.fit(model)
 results = trainer.test(model)

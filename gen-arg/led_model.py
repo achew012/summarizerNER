@@ -22,6 +22,8 @@ class LEDConstrainedGen(PreTrainedModel):
         self.transformer = LEDModel.from_pretrained("allenai/led-base-16384", config=self.config)
         self.register_buffer("final_logits_bias", torch.zeros((1, self.transformer.shared.num_embeddings)))
 
+        self.lm_head = nn.Linear(self.config.d_model, len(self.tokenizer), bias=False)
+
 
     def _set_global_attention_mask(self, input_ids):
         """Configure the global attention pattern based on the task"""
@@ -165,7 +167,7 @@ class LEDConstrainedGen(PreTrainedModel):
         past_key_values=None,
         decoder_input_ids=None, 
         decoder_attention_mask=None,
-        output_attentions=None,
+        output_attentions=True,
         output_hidden_states=True,
         return_dict=None, 
         input_embeds=None,
@@ -173,11 +175,14 @@ class LEDConstrainedGen(PreTrainedModel):
 
         # generation
         if task==-1:
+            
+            # ipdb.set_trace()
+
             outputs = self.transformer(
             input_ids=input_ids,
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
-            use_cache=use_cache, 
+            use_cache=False, 
             encoder_outputs=encoder_outputs,
             past_key_values=past_key_values,
             output_attentions=output_attentions,
@@ -186,18 +191,48 @@ class LEDConstrainedGen(PreTrainedModel):
             global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
             return_dict=return_dict,)
 
+            #############################################################
 
-            decoder_output = outputs[0] #(batch, seq_len, hidden_dim)
-            if encoder_outputs==None:
-                encoder_outputs = outputs[1] # (batch, input_seq_len, hidden_dim) 
-                # BaseModelOutput if return dict  
+            cross_attention_non_linear = self.transformer.decoder.layers[-1].encoder_attn.out_proj.weight
+            cross_attention_non_linear_sum = cross_attention_non_linear.view(self.config.decoder_attention_heads, -1).abs().sum(1)
+            _, selected_heads = torch.topk(cross_attention_non_linear_sum, k=6)
+            self.selected_heads = selected_heads
 
-            if input_embeds==None:
-                # get encoder side embeddings 
-                input_embeds = self.transformer.encoder.embed_tokens(input_ids) #* self.transformer.encoder.embed_scale #(batch, seq_len, input_seq_len)
+            last_cross_attentions = outputs.cross_attentions[-1] 
+            cross_attentions_aggregate = last_cross_attentions[:,self.selected_heads,:,:].mean(dim=1)
+
+            # ipdb.set_trace()
+
+            decoder_output = outputs.last_hidden_state #(batch, seq_len, hidden_dim)
+            encoder_output = outputs.encoder_last_hidden_state # (batch, input_seq_len, hidden_dim)
+            # lm_logits = F.linear(decoder_output, self.transformer.shared.weight, bias=self.final_logits_bias)
+            # lm_logits = self.remove_unseen(lm_logits, input_ids)
+
+            lm_logits = self.lm_head(decoder_output) 
+
+            #ipdb.set_trace()
+
+            dummy_input_ids = input_ids.unsqueeze(-1).expand(-1, -1, lm_logits.size(1)).transpose(1,2) # (batch, decoding_seq_length, encoding_seq_length)
+            copy_logits = torch.zeros_like(lm_logits) # (batch, decoding_seq_length, emb_dim)
+            copy_logits.scatter_add_(dim=2, index=dummy_input_ids, src=cross_attentions_aggregate)
             
-            pointer_logits = torch.einsum('ijk,ilk->ijl', decoder_output, input_embeds) #(batch, seq_len, input_seq_len)
-            lm_logits = self.convert_pointer_logits_to_lm_logits(pointer_logits, input_ids)
+            p_gen = torch.bmm(decoder_output, encoder_output.mean(dim=1).unsqueeze(dim=-1)) # (batch, decoding_seq, 1)
+            p_gen = torch.sigmoid(p_gen)
+            lm_logits = F.softmax(lm_logits, dim=-1) * p_gen + copy_logits * (1 - p_gen)
+            
+            ###############################################################
+
+            # decoder_output = outputs[0] #(batch, seq_len, hidden_dim)
+            # if encoder_outputs==None:
+            #     encoder_outputs = outputs[1] # (batch, input_seq_len, hidden_dim) 
+            #     # BaseModelOutput if return dict  
+
+            # if input_embeds==None:
+            #     # get encoder side embeddings 
+            #     input_embeds = self.transformer.encoder.embed_tokens(input_ids) #* self.transformer.encoder.embed_scale #(batch, seq_len, input_seq_len)
+            
+            # pointer_logits = torch.einsum('ijk,ilk->ijl', decoder_output, input_embeds) #(batch, seq_len, input_seq_len)
+            # lm_logits = self.convert_pointer_logits_to_lm_logits(pointer_logits, input_ids)
             
             masked_lm_loss = None
             
@@ -236,26 +271,46 @@ class LEDConstrainedGen(PreTrainedModel):
             #global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
             return_dict=return_dict,)
             
-            #ipdb.set_trace()        
+            ###################### COPY MECHANISM ################
+
+            cross_attention_non_linear = self.transformer.decoder.layers[-1].encoder_attn.out_proj.weight
+            cross_attention_non_linear_sum = cross_attention_non_linear.view(self.config.decoder_attention_heads, -1).abs().sum(1)
+            _, selected_heads = torch.topk(cross_attention_non_linear_sum, k=6)
+            self.selected_heads = selected_heads
+
+            last_cross_attentions = outputs.cross_attentions[-1] 
+            cross_attentions_aggregate = last_cross_attentions[:,self.selected_heads,:,:].mean(dim=1)
 
             decoder_output = outputs.last_hidden_state #(batch, seq_len, hidden_dim)
             encoder_output = outputs.encoder_hidden_states[-1] # (batch, input_seq_len, hidden_dim)
             # lm_logits = F.linear(decoder_output, self.transformer.shared.weight, bias=self.final_logits_bias)
             # lm_logits = self.remove_unseen(lm_logits, input_ids)
+
+            lm_logits = self.lm_head(decoder_output) 
+
+            dummy_input_ids = input_ids.unsqueeze(-1).expand(-1, -1, lm_logits.size(1)).transpose(1,2) # (batch, decoding_seq_length, encoding_seq_length)
+            copy_logits = torch.zeros_like(lm_logits) # (batch, decoding_seq_length, emb_dim)
+            copy_logits.scatter_add_(dim=2, index=dummy_input_ids, src=cross_attentions_aggregate)
             
-            # get encoder side embeddings 
-            input_embeds = self.transformer.encoder.embed_tokens(input_ids) #* self.transformer.encoder.embed_scale #(batch, seq_len, input_seq_len)
-            pointer_logits = torch.einsum('ijk,ilk->ijl', decoder_output, input_embeds) #(batch, seq_len, input_seq_len)
-            # decrease <arg> prob if neccesary 
+            p_gen = torch.bmm(decoder_output, encoder_output.mean(dim=1).unsqueeze(dim=-1)) # (batch, decoding_seq, 1)
+            p_gen = torch.sigmoid(p_gen)
+            lm_logits = F.softmax(lm_logits, dim=-1) * p_gen + copy_logits * (1 - p_gen)
+            
+            ######################################################
+            # ipdb.set_trace()        
 
-            lm_logits = self.convert_pointer_logits_to_lm_logits(pointer_logits, input_ids)
-            outputs = (lm_logits,) + outputs[1:]  # Add cache, hidden states and attention if they are here
+            # # get encoder side embeddings 
+            # input_embeds = self.transformer.encoder.embed_tokens(input_ids) #* self.transformer.encoder.embed_scale #(batch, seq_len, input_seq_len)
+            # pointer_logits = torch.einsum('ijk,ilk->ijl', decoder_output, input_embeds) #(batch, seq_len, input_seq_len)
+            # # decrease <arg> prob if neccesary 
 
-            loss_fct = nn.NLLLoss() 
-            #loss_fct = nn.CrossEntropyLoss() #higher loss
+            # lm_logits = self.convert_pointer_logits_to_lm_logits(pointer_logits, input_ids)
+            # outputs = (lm_logits,) + outputs[1:]  # Add cache, hidden states and attention if they are here
 
+            #loss_fct = nn.NLLLoss(ignore_index=-100) 
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             masked_lm_loss = loss_fct(lm_logits.view(-1, self.vocab_size), labels.view(-1))
-            outputs = (masked_lm_loss,) + outputs
+            outputs = (masked_lm_loss,) + (lm_logits,)
 
             return outputs
 
@@ -630,12 +685,14 @@ class LEDConstrainedGen(PreTrainedModel):
         unfinished_sents = input_ids.new(batch_size).fill_(1)
         sent_lengths = input_ids.new(batch_size).fill_(max_length)
 
+        #ipdb.set_trace()
+
         past = None
         while cur_len < max_length:
             model_inputs = self.prepare_inputs_for_generation(
                 input_ids, past=past, attention_mask=attention_mask, use_cache=use_cache, **model_kwargs
             )
-            
+
             outputs = self(**model_inputs, return_dict=True) 
             # calling forward here 
             

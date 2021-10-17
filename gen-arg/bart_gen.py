@@ -170,7 +170,6 @@ class BartConstrainedGen(PreTrainedModel):
                 input_embeds = self.transformer.encoder.embed_tokens(input_ids) * self.transformer.encoder.embed_scale #(batch, seq_len, input_seq_len)
             pointer_logits = torch.einsum('ijk,ilk->ijl', decoder_output, input_embeds) #(batch, seq_len, input_seq_len)
             lm_logits = self.convert_pointer_logits_to_lm_logits(pointer_logits, input_ids)
-
             
             masked_lm_loss = None
             
