@@ -247,11 +247,12 @@ class LEDConstrainedGen(PreTrainedModel):
             input_embeds = self.transformer.encoder.embed_tokens(input_ids) #* self.transformer.encoder.embed_scale #(batch, seq_len, input_seq_len)
             pointer_logits = torch.einsum('ijk,ilk->ijl', decoder_output, input_embeds) #(batch, seq_len, input_seq_len)
             # decrease <arg> prob if neccesary 
-            lm_logits = self.convert_pointer_logits_to_lm_logits(pointer_logits, input_ids)
 
+            lm_logits = self.convert_pointer_logits_to_lm_logits(pointer_logits, input_ids)
             outputs = (lm_logits,) + outputs[1:]  # Add cache, hidden states and attention if they are here
+
             loss_fct = nn.NLLLoss() 
-            #loss_fct = nn.CrossEntropyLoss() higher loss
+            #loss_fct = nn.CrossEntropyLoss() #higher loss
 
             masked_lm_loss = loss_fct(lm_logits.view(-1, self.vocab_size), labels.view(-1))
             outputs = (masked_lm_loss,) + outputs

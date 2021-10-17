@@ -1,3 +1,7 @@
 lightning_logs
 mlruns
 epoch=*
+gen-arg/lightning_logs
+gen-arg/__pycache__
+qa/lightning_logs
+qa/__pycache__

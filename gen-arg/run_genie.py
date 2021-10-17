@@ -4,10 +4,10 @@ import json, os, ipdb
 
 config = {
 "seed": 1234, 
-"lr": 3e-05, 
+"lr": 3e-04, 
 "warmup": 1000, 
 "num_workers": 4, 
-"max_output_len": 64, 
+"max_output_len": 96, 
 "data_dir": "/data",
 "output_dir": "./saved_models/test", 
 "val_every": 0.33, 
@@ -18,7 +18,7 @@ config = {
 "fp16": False, 
 "grad_ckpt": True, 
 "attention_window": 256,
-"num_epochs": 10,
+"num_epochs": 5,
 "max_steps": -1,
 "weight_decay": 0.0,
 "adam_epsilon": 1e-8,
@@ -94,19 +94,17 @@ from led_model import LEDConstrainedGen
 from bart_gen import BartConstrainedGen
 
 role_map = {
-    '<PerpOrg>': 'perpetrator organizations', 
-    '<PerpInd>': 'perpetrator individuals',
-    '<Victim>': 'victims',
-    '<Target>': 'targets',
-    '<Weapon>': 'weapons'
+    'PerpOrg': '<PerpOrg>', 
+    'PerpInd': '<PerpInd>',
+    'Victim': '<Victim>',
+    'Target': '<Target>',
+    'Weapon': '<Weapon>'
 }
 
 #########################################################################################################################################
 def convert_templates_to_prompts(templates, tokenizer):
-    #input_template = ["<ent> from <ent> used <ent> to attack <ent> harming <ent>"  for doc in templates]
-    #filled_templates = ["{} from {} used {} to attack {} harming {}".format(doc["perpetrator individuals"], doc["perpetrator organizations"], doc["weapons"], doc["targets"], doc["victims"]) for doc in templates]
-    input_template = ["<PerpOrg> <ent> <PerpInd> <ent> <Victim> <ent> <Target> <ent> <Weapon> <ent>"  for doc in templates]
-    filled_templates = ["<PerpOrg> {} <PerpInd> {} <Victim> {} <Target> {} <Weapon> {}".format(doc["perpetrator individuals"], doc["perpetrator organizations"], doc["weapons"], doc["targets"], doc["victims"]) for doc in templates]
+    input_template = ["<PerpOrg><ent><PerpInd><ent><Victim><ent><Target><ent><Weapon><ent>" for doc in templates]
+    filled_templates = ["<PerpInd>{}<PerpOrg>{}<Victim>{}<Target>{}<Weapon>{}".format(doc["<PerpInd>"], doc["<PerpOrg>"], doc["<Victim>"], doc["<Target>"], doc["<Weapon>"]) for doc in templates]
     return input_template, filled_templates
 
 class NERDataset(Dataset):
@@ -116,12 +114,12 @@ class NERDataset(Dataset):
         self.tokenizer = tokenizer
         self.docs = [doc["doctext"] for doc in dataset]
         # take only 1st mention of each role
-        first_mention_extracts = [{role_map[key].lower(): doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else "<ent>" for key in doc["extracts"].keys()} for doc in dataset]
+        first_mention_extracts = [{role_map[key]: doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else "<ent>" for key in doc["extracts"].keys()} for doc in dataset]
         # convert extracts to prompt template
         self.input_template, self.filled_templates = convert_templates_to_prompts(first_mention_extracts, tokenizer)
         self.encodings = self.tokenizer(self.input_template, self.docs, padding="max_length", truncation=True, max_length=args.max_input_len, return_tensors="pt")        
         self.decoder_encodings = self.tokenizer(self.filled_templates, padding="max_length", truncation=True, max_length=args.max_output_len, return_tensors="pt")
-        import ipdb; ipdb.set_trace()
+        #import ipdb; ipdb.set_trace()
 
     def __len__(self):
         """Returns length of the dataset"""
@@ -173,7 +171,7 @@ class NERLED(pl.LightningModule):
         # Load tokenizer and metric
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.model_name, use_fast=True)
         self.tokenizer.add_tokens(['<ent>'])
-        self.tokenizer.add_tokens(list(role_map.keys()))
+        self.tokenizer.add_tokens([value for key, value in role_map.items()])
 
         self.vocab_size = len(self.tokenizer) 
         self.scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
@@ -243,12 +241,10 @@ class NERLED(pl.LightningModule):
     def validation_epoch_end(self, outputs):
         avg_loss = torch.mean(torch.stack(outputs))
         log = {
-            'val/loss': avg_loss, 
+            'val_loss': avg_loss, 
         } 
-        return {
-            'loss': avg_loss, 
-            'log': log
-        }
+
+        self.log("val_loss", log["val_loss"])
 
     def test_step(self, batch, batch_idx):
         # if self.args.sample_gen:
@@ -256,8 +252,9 @@ class NERLED(pl.LightningModule):
         #                         top_k=20, top_p=0.95, max_length=30, num_return_sequences=1,num_beams=1,
         #                     )
         # else:
+
         sample_output = self.model.generate(batch['input_token_ids'], do_sample=False, 
-                            max_length=30, num_return_sequences=1,num_beams=1,
+                            max_length=self.args.max_output_len, num_return_sequences=1,num_beams=5,
                         )
         
         sample_output = sample_output.reshape(batch['input_token_ids'].size(0), 1, -1)
@@ -324,7 +321,7 @@ class NERLED(pl.LightningModule):
 checkpoint_callback = pl.callbacks.ModelCheckpoint(
     dirpath = "./",
     filename="best_ner_model", 
-    monitor="val_accuracy", 
+    monitor="val_loss", 
     mode="max", 
     save_top_k=1, 
     save_weights_only=True,
