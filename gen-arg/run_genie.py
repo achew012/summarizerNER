@@ -4,7 +4,7 @@ import json, os, ipdb
 
 config = {
 "seed": 1234, 
-"lr": 5e-03, 
+"lr": 3e-05, 
 "warmup": 1000, 
 "num_workers": 4, 
 "max_output_len": 64, 
@@ -94,17 +94,19 @@ from led_model import LEDConstrainedGen
 from bart_gen import BartConstrainedGen
 
 role_map = {
-    'PerpOrg': 'perpetrator organizations', 
-    'PerpInd': 'perpetrator individuals',
-    'Victim': 'victims',
-    'Target': 'targets',
-    'Weapon': 'weapons'
+    '<PerpOrg>': 'perpetrator organizations', 
+    '<PerpInd>': 'perpetrator individuals',
+    '<Victim>': 'victims',
+    '<Target>': 'targets',
+    '<Weapon>': 'weapons'
 }
 
 #########################################################################################################################################
 def convert_templates_to_prompts(templates, tokenizer):
-    input_template = ["The <arg> from <arg> used a <arg> to attack <arg> injuring <arg>"  for doc in templates]
-    filled_templates = ["{} from {} used {} to attack {} harming {}".format(doc["perpetrator individuals"], doc["perpetrator organizations"], doc["weapons"], doc["targets"], doc["victims"]) for doc in templates]
+    #input_template = ["<ent> from <ent> used <ent> to attack <ent> harming <ent>"  for doc in templates]
+    #filled_templates = ["{} from {} used {} to attack {} harming {}".format(doc["perpetrator individuals"], doc["perpetrator organizations"], doc["weapons"], doc["targets"], doc["victims"]) for doc in templates]
+    input_template = ["<PerpOrg> <ent> <PerpInd> <ent> <Victim> <ent> <Target> <ent> <Weapon> <ent>"  for doc in templates]
+    filled_templates = ["<PerpOrg> {} <PerpInd> {} <Victim> {} <Target> {} <Weapon> {}".format(doc["perpetrator individuals"], doc["perpetrator organizations"], doc["weapons"], doc["targets"], doc["victims"]) for doc in templates]
     return input_template, filled_templates
 
 class NERDataset(Dataset):
@@ -119,7 +121,7 @@ class NERDataset(Dataset):
         self.input_template, self.filled_templates = convert_templates_to_prompts(first_mention_extracts, tokenizer)
         self.encodings = self.tokenizer(self.input_template, self.docs, padding="max_length", truncation=True, max_length=args.max_input_len, return_tensors="pt")        
         self.decoder_encodings = self.tokenizer(self.filled_templates, padding="max_length", truncation=True, max_length=args.max_output_len, return_tensors="pt")
-        # import ipdb; ipdb.set_trace()
+        import ipdb; ipdb.set_trace()
 
     def __len__(self):
         """Returns length of the dataset"""
@@ -171,6 +173,8 @@ class NERLED(pl.LightningModule):
         # Load tokenizer and metric
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.model_name, use_fast=True)
         self.tokenizer.add_tokens(['<ent>'])
+        self.tokenizer.add_tokens(list(role_map.keys()))
+
         self.vocab_size = len(self.tokenizer) 
         self.scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
 

@@ -44,7 +44,7 @@ config = {
 #json.load(open('config.json'))
 
 args = argparse.Namespace(**config)
-task = Task.init(project_name='LangGen', task_name='promptNER-QA-Base', output_uri="s3://experiment-logging/storage/")
+task = Task.init(project_name='LangGen', task_name='MRC-NER', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
 task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
