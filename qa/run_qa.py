@@ -38,7 +38,7 @@ config = {
 "num_epochs": 10,
 "use_entity_embeddings": False,
 "model_name": "allenai/longformer-base-4096",
-#"model_name": "mrm8488/longformer-base-4096-finetuned-squadv2"  
+#"model_name": "mrm8488/longformer-base-4096-finetuned-squadv2",  
 "debug": False
 }
 #json.load(open('config.json'))
@@ -109,7 +109,6 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoConfig, AutoModelForSeq2SeqLM, set_seed, get_linear_schedule_with_warmup
 from seqeval.metrics import f1_score, precision_score, recall_score, accuracy_score
-from rouge_score import rouge_scorer
 from eval import eval_ceaf
 
 role_map = {
@@ -314,16 +313,22 @@ class NERLongformerQA(pl.LightningModule):
 
         # Use pretrained embeddings
         if self.args.use_entity_embeddings:
+
             pretrained_lm_path = bucket_ops.get_file(
-            remote_path="s3://experiment-logging/storage/ner-pretraining/NER-LM.c1a2da99836542849c6e8358498fed81/models/best_entity_lm.ckpt"
+                remote_path="s3://experiment-logging/storage/ner-pretraining/MLM-Loss.118725620595422d84ed3379b630a0c9/models/best_entity_lm.ckpt"
             )
+
+            # pretrained_lm_path = "./best_entity_lm.ckpt"
+
             lm_args={
-                "num_epochs":10,
-                "train_batch_size":6,
-                "eval_batch_size":4
-            }  
-            self.longformer = NERLongformer.load_from_checkpoint(pretrained_lm_path, args = lm_args)
-        
+                "lr": 3e-4,
+                "train_batch_size":1,
+                "eval_batch_size":1,
+            }
+
+            self.longformer = NERLongformer.load_from_checkpoint(pretrained_lm_path, args = lm_args).longformer
+
+
     def _set_global_attention_mask(self, input_ids):
         """Configure the global attention pattern based on the task"""
 
@@ -451,7 +456,6 @@ class NERLongformerQA(pl.LightningModule):
 
         #For each sample in batch
         for start_candidates, start_candidates_logits, end_candidates, end_candidates_logits, tokens, question_indices, start_gold, end_gold, attention_mask, docid, gold_mention in zip(candidates_start_batch.indices, candidates_start_batch.values, candidates_end_batch.indices, candidates_end_batch.values, batch["input_ids"], question_indices_batch, batch["start_positions"], batch["end_positions"], batch["attention_mask"], docids, gold_mentions):
-
             valid_candidates = []
             # For each candidate in sample
             for start_index, start_score in zip(start_candidates, start_candidates_logits):
@@ -536,8 +540,6 @@ class NERLongformerQA(pl.LightningModule):
                     predictions[sample["docid"]]["gold_mention"].append(sample["gold_mention"])
                     predictions[sample["docid"]]["gold"].append(sample["gold"])
                     predictions[sample["docid"]]["candidates"].append(sample["candidates"][:1])
- 
-        #raw_results = [{**value} for key, value in predictions.items()]
 
         preds = OrderedDict()
         for key, doc in predictions.items():
@@ -553,6 +555,7 @@ class NERLongformerQA(pl.LightningModule):
                         else:    
                             preds[key][role] = [[doc["candidates"][idx][0][2].replace("</s>", "")]]                
 
+        preds_list = [{**doc, "docid": key} for key, doc in preds.items()]
         results = eval_ceaf(preds, golds)
         print("================= CEAF score =================")
         print("phi_strict: P: {:.2f}%,  R: {:.2f}%, F1: {:.2f}%".format(results["strict"]["micro_avg"]["p"] * 100, results["strict"]["micro_avg"]["r"] * 100, results["strict"]["micro_avg"]["f1"] * 100))
@@ -567,14 +570,13 @@ class NERLongformerQA(pl.LightningModule):
 
         # f1_list = [compute_f1(gold, pred) for pred, gold in zip(pred_list, gold_list)]
         # mean_F1 = sum(f1_list)/len(f1_list)
-
         # EM_list = [compute_exact(gold, pred) for pred, gold in zip(pred_list, gold_list)]
         # mean_EM = sum(EM_list)/len(EM_list)
 
         #clearlogger.report_scalar(title='f1', series = 'test', value=mean_F1, iteration=1) 
         #clearlogger.report_scalar(title='EM', series = 'test', value=mean_EM, iteration=1) 
 
-        to_jsonl("./predictions.jsonl", results)
+        to_jsonl("./predictions.jsonl", preds_list)
         task.upload_artifact(name='predictions', artifact_object="./predictions.jsonl")
         return {"results": results}
 
@@ -628,11 +630,11 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
 )
 
 trained_model_path = bucket_ops.get_file(
-            remote_path="s3://experiment-logging/storage/LangGen/promptNER-QA-Base.8a4f96a4f4d1411fbfd64a56a43f6644/models/best_ner_model.ckpt"
+            remote_path="s3://experiment-logging/storage/LangGen/promptNER-QA-Base.7ffa23a05839464980272aa317353fc3/models/best_ner_model.ckpt"
             )
 
 #model = NERLongformerQA(args)
 model = NERLongformerQA.load_from_checkpoint(trained_model_path, params = args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback])
-trainer.fit(model)
+#trainer.fit(model)
 results = trainer.test(model)

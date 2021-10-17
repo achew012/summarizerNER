@@ -112,8 +112,6 @@ def eval_ceaf(preds, golds, docids=[]):
                 for idy in range(len(preds[docid][role][idx])):
                     preds[docid][role][idx][idy] = normalize_string(preds[docid][role][idx][idy])
 
-    print(preds)
-
     for docid in golds:
         for role in golds[docid]:
             for idx in range(len(golds[docid][role])):
