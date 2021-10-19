@@ -18,14 +18,14 @@ config = {
 "fp16": False, 
 "grad_ckpt": True, 
 "attention_window": 256,
-"num_epochs": 1,
+"num_epochs": 5,
 "max_steps": -1,
 "weight_decay": 0.0,
 "adam_epsilon": 1e-8,
 "gradient_clip_val": 1.0,
 "warmup_steps": 0,
-#"model_name": 'allenai/led-base-16384',
-"model_name": 'facebook/bart-large'
+"model_name": 'allenai/led-base-16384',
+#"model_name": 'facebook/bart-large'
 }
 args = argparse.Namespace(**config)
 
@@ -33,9 +33,9 @@ Task.add_requirements('transformers', package_version='4.2.0')
 task = Task.init(project_name='LangGen', task_name='promptNER-fixedwords-led', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
-task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
-task.connect(args)
-task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+# task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+# task.connect(args)
+# task.execute_remotely(queue_name="128RAMv100", exit_process=True)
 
 class bucket_ops:
     StorageManager.set_cache_file_limit(5, cache_context=None)
@@ -103,7 +103,8 @@ role_map = {
 
 #########################################################################################################################################
 def convert_templates_to_prompts(templates, tokenizer):
-    input_template = ["<PerpOrg><mask><PerpInd><mask><Victim><mask><Target><mask><Weapon><mask>" for doc in templates]
+    input_template = ["<PerpOrg><PerpInd><Victim><Target><Weapon>" for doc in templates]
+    
     filled_templates = ["<PerpInd>{}<PerpOrg>{}<Victim>{}<Target>{}<Weapon>{}".format(doc["<PerpInd>"], doc["<PerpOrg>"], doc["<Victim>"], doc["<Target>"], doc["<Weapon>"]) for doc in templates]
     return input_template, filled_templates
 
@@ -117,7 +118,8 @@ class NERDataset(Dataset):
         first_mention_extracts = [{role_map[key]: doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else "" for key in doc["extracts"].keys()} for doc in dataset]
         # convert extracts to prompt template
         self.input_template, self.filled_templates = convert_templates_to_prompts(first_mention_extracts, tokenizer)
-        self.encodings = self.tokenizer(self.input_template, self.docs, padding="max_length", truncation=True, max_length=args.max_input_len, return_tensors="pt")        
+        #self.encodings = self.tokenizer(self.input_template, self.docs, padding="max_length", truncation=True, max_length=args.max_input_len, return_tensors="pt")        
+        self.encodings = self.tokenizer(self.docs, padding="max_length", truncation=True, max_length=args.max_input_len, return_tensors="pt")
         self.decoder_encodings = self.tokenizer(self.filled_templates, padding="max_length", truncation=True, max_length=args.max_output_len, return_tensors="pt")
 
     def __len__(self):
@@ -180,7 +182,8 @@ class NERLED(pl.LightningModule):
         elif self.args.model_name == "facebook/bart-large":
             self.model = BartConstrainedGen(self.config, self.tokenizer)
 
-        self.model.resize_token_embeddings() 
+        self.model.resize_token_embeddings()
+
         
     def training_step(self, batch, batch_nb):
         """Call the forward pass then return loss"""

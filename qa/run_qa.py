@@ -487,7 +487,7 @@ class NERLongformerQA(pl.LightningModule):
                     "start_gold": start_gold.item(),
                     "end_gold": end_gold.item(),
                     "gold": self.tokenizer.decode(tokens[start_gold:end_gold]),
-                    "candidates": valid_candidates[:3]
+                    "candidates": valid_candidates[:5]
                 }
             )
 

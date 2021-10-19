@@ -1,19 +1,24 @@
 from datasets import load_dataset
-
-
 from clearml import Task, StorageManager, Dataset
 import argparse
-import json, os
+import json, os, ipdb
+import jsonlines
 
 config = json.load(open('config.json'))
 args = argparse.Namespace(**config)
 
-task = Task.init(project_name='LangGen', task_name='promptNER-QA-train', output_uri="s3://experiment-logging/storage/")
+task = Task.init(project_name='LongformerNER', task_name='simpleTokenClassification', tags=["muc4"], output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
 task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
 task.connect(args)
 task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+
+''' Writes to a jsonl file'''
+def to_jsonl(filename:str, file_obj):
+    resultfile = open(filename, 'wb')
+    writer = jsonlines.Writer(resultfile)
+    writer.write_all(file_obj)
 
 class bucket_ops:
     StorageManager.set_cache_file_limit(5, cache_context=None)
@@ -44,11 +49,11 @@ class bucket_ops:
 
 
 # #Read args from config file instead, use vars() to convert namespace to dict
-#dataset = Dataset.get(dataset_name="muc4-processed", dataset_project="datasets/muc4", dataset_tags=["processed", "GRIT"], only_published=True)
-#dataset_folder = dataset.get_local_copy()
-#print(list(os.walk(os.path.join(dataset_folder, "data/muc4-grit/processed"))))
+dataset = Dataset.get(dataset_name="muc4-processed", dataset_project="datasets/muc4", dataset_tags=["processed", "GRIT"], only_published=True)
+dataset_folder = dataset.get_local_copy()
+print(list(os.walk(os.path.join(dataset_folder, "data/muc4-grit/processed"))))
 
-dataset = load_dataset("wnut_17")
+# dataset = load_dataset("wnut_17")
 
 def read_json(jsonfile):
     with open(jsonfile, 'rb') as file:
@@ -58,6 +63,7 @@ def read_json(jsonfile):
 train_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/train.json"))
 dev_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/dev.json"))
 test_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/test.json"))
+
 muc4 = {
     "train": train_data,
     "val": dev_data,
@@ -71,9 +77,7 @@ from torch import nn
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoConfig, AutoModelForSeq2SeqLM, set_seed, get_linear_schedule_with_warmup
-from seqeval.metrics import f1_score, precision_score, recall_score, accuracy_score
-from rouge_score import rouge_scorer
-
+from sklearn.metrics import classification_report
 
 role_map = {
     'PerpOrg': 'perpetrator organizations', 
@@ -87,34 +91,91 @@ role_map = {
 class NERDataset(Dataset):
     # doc_list
     # extracted_list as template
-    def __init__(self, dataset, tokenizer, args):
+    def __init__(self, dataset, tokenizer, labels2idx, args):
         self.tokenizer = tokenizer
-        # first_mention_position = [{
-        #     "qns": [role_map[key].lower() for key in doc["extracts"].keys()], 
-        #     "context": [doc["doctext"] for key in doc["extracts"].keys()], 
-        #     "start": [doc["extracts"][key][0][0][1] if len(doc["extracts"][key])>0 else None for key in doc["extracts"].keys()], 
-        #     "end": [doc["extracts"][key][0][0][1]+len(doc["extracts"][key][0][0][0]) if len(doc["extracts"][key])>0 else None for key in doc["extracts"].keys()]
-        #     } for doc in dataset]
+        self.processed_dataset = {
+            "docid": [],
+            "context": [],
+            "input_ids": [],
+            "attention_mask": [],
+            "gold_mentions": [],
+            "labels": [],
+        }
+        self.labels2idx = labels2idx
 
-        self.first_mention_position = {
-            "qns": ["who are the {} entities?".format(role_map[key].lower()) for doc in dataset for key in doc["extracts"].keys()], 
-            "context": [doc["doctext"] for doc in dataset for key in doc["extracts"].keys()],
-            # Add 3 in the indices to factor in <s>...</s></s>... 
-            "start": [doc["extracts"][key][0][0][1]+3 if len(doc["extracts"][key])>0 else 0 for doc in dataset for key in doc["extracts"].keys()], 
-            "end": [doc["extracts"][key][0][0][1]+len(self.tokenizer.encode(doc["extracts"][key][0][0][0]))+3 if len(doc["extracts"][key])>0 else 0 for doc in dataset for key in doc["extracts"].keys()]
-            }
+        for doc in dataset:
+            docid = doc["docid"]
+            context = doc["doctext"] #self.tokenizer.decode(self.tokenizer.encode(doc["doctext"]))
+            ### Only take the 1st label of each role
+            qns_ans = [[key, doc["extracts"][key][0][0][1] if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][1]+len(doc["extracts"][key][0][0][0]) if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else ""] for key in doc["extracts"].keys()]    
 
-        self.context = tokenizer(self.first_mention_position["qns"], self.first_mention_position["context"], padding=True, truncation=True, max_length=1024, return_tensors="pt")
+            ### expand on all labels in each role
+            #qns_ans = [["who are the {} entities?".format(role_map[key].lower()), mention[1] if len(mention)>0 else 0, mention[1]+len(mention[0]) if len(mention)>0 else 0, mention[0] if len(mention)>0 else ""] for key in doc["extracts"].keys() for cluster in doc["extracts"][key] for mention in cluster]    
+
+            #labels = [-100]*(self.tokenizer.model_max_length)
+            labels = [self.labels2idx["O"]]*(self.tokenizer.model_max_length)
+            
+            length_of_sequence = len(self.tokenizer.tokenize(context)) if len(self.tokenizer.tokenize(context))<=len(labels) else len(labels)
+            
+            labels[:length_of_sequence] = [self.labels2idx["O"]]*length_of_sequence            
+
+            context_encodings = self.tokenizer(context, padding="max_length", truncation=True, max_length=self.tokenizer.model_max_length, return_offsets_mapping=True, return_tensors="pt")
+
+            for qns, ans_char_start, ans_char_end, mention in qns_ans:
+                sequence_ids = context_encodings.sequence_ids()
+
+                # Detect if the answer is out of the span (in which case this feature is labeled with the CLS index).
+                pad_start_idx = sequence_ids[sequence_ids.index(0):].index(None)
+                offsets_wo_pad = context_encodings["offset_mapping"][0][sequence_ids.index(0):pad_start_idx]
+
+                if ans_char_end>offsets_wo_pad[-1][1] or ans_char_start>offsets_wo_pad[-1][1]:
+                    ans_char_start = 0
+                    ans_char_end = 0
+
+                if ans_char_start==0 and ans_char_end==0:
+                    token_span=[0,0]
+                else:
+                    token_span=[]
+                    for idx, span in enumerate(offsets_wo_pad):
+                        if ans_char_start>=span[0] and ans_char_start<=span[1] and len(token_span)==0:
+                            token_span.append(idx) 
+
+                        if ans_char_end>=span[0] and ans_char_end<=span[1] and len(token_span)==1:
+                            token_span.append(idx)
+                            break                        
+                
+                # If token span is incomplete
+                if len(token_span)<2:
+                    ipdb.set_trace()
+
+                # self.processed_dataset["docid"].append(docid)
+                # self.processed_dataset["context"].append(context)
+                # self.processed_dataset["input_ids"].append(context_encodings["input_ids"].squeeze(0))
+                # self.processed_dataset["attention_mask"].append(context_encodings["attention_mask"].squeeze(0))
+                # self.processed_dataset["qns"].append(docid)
+                # self.processed_dataset["gold_mentions"].append(mention)
+                # self.processed_dataset["start"].append(token_span[0])
+                # self.processed_dataset["end"].append(token_span[1]+1)
+
+                if token_span!=[0,0]:
+                    labels[token_span[0]:token_span[0]+1] = [self.labels2idx["B-"+qns]]
+                    if len(labels[token_span[0]+1:token_span[1]+1])>0 and (token_span[1]-token_span[0])>0:
+                        labels[token_span[0]+1:token_span[1]+1] = [self.labels2idx["I-"+qns]]*(token_span[1]-token_span[0])
+
+            self.processed_dataset["docid"].append(docid)
+            self.processed_dataset["context"].append(context)
+            self.processed_dataset["input_ids"].append(context_encodings["input_ids"].squeeze(0))
+            self.processed_dataset["attention_mask"].append(context_encodings["attention_mask"].squeeze(0))
+            self.processed_dataset["gold_mentions"].append(mention)
+            self.processed_dataset["labels"].append(torch.tensor(labels))
 
     def __len__(self):
         """Returns length of the dataset"""
-        return len(self.first_mention_position["context"])
+        return len(self.processed_dataset["docid"])
 
     def __getitem__(self, idx):
         """Gets an example from the dataset. The input and output are tokenized and limited to a certain seqlen."""
-        item = {key: val[idx] for key, val in self.context.items()}
-        item['start'] = torch.tensor(self.first_mention_position["start"])[idx]
-        item['end'] = torch.tensor(self.first_mention_position["end"])[idx]
+        item = {key: val[idx] for key, val in self.processed_dataset.items()}
         return item
 
     @staticmethod
@@ -130,18 +191,18 @@ class NERDataset(Dataset):
 
         input_ids = torch.stack([ex['input_ids'] for ex in batch]) 
         attention_mask = torch.stack([ex['attention_mask'] for ex in batch]) 
-        start = torch.stack([ex['start'] for ex in batch]) 
-        end = torch.stack([ex['end'] for ex in batch]) 
+        labels = torch.stack([ex['labels'] for ex in batch]) 
         
         return {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
-            'start_positions': start,
-            'end_positions': end,
+            'labels': labels,
         }
 
 ####################################################################################################################
-from transformers import LEDTokenizer, LongformerModel
+from transformers import AutoTokenizer, AutoModelForTokenClassification
+from sklearn.utils.class_weight import compute_class_weight
+import numpy as np
 
 class NERLongformer(pl.LightningModule):
     """Pytorch Lightning module. It wraps up the model, data loading and training code"""
@@ -152,12 +213,35 @@ class NERLongformer(pl.LightningModule):
         self.args = params
         self.dataset = muc4
 
+        self.labels2idx = {classname: idx+1 for idx, classname in enumerate([prefix+key for key in role_map.keys() for prefix in ["B-", "I-"]])}
+        self.labels2idx["O"] = 0
+
         # Load and update config then load a pretrained LEDForConditionalGeneration
         self.config = AutoConfig.from_pretrained("allenai/longformer-base-4096")
         self.config.gradient_checkpointing = True
-        self.model = LongformerModel.from_pretrained("allenai/longformer-base-4096", config=self.config)
+        self.config.num_labels = len(self.labels2idx.keys())
+        self.model = AutoModelForTokenClassification.from_pretrained("allenai/longformer-base-4096", config=self.config)
         # Load tokenizer and metric
-        self.tokenizer = LEDTokenizer.from_pretrained("allenai/longformer-base-4096", use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained("allenai/longformer-base-4096", use_fast=True)
+        self.tokenizer.model_max_length = 1024
+        self.softmax = nn.Softmax(dim=-1)
+
+        dataset_split = self.dataset["train"]
+        dataset = NERDataset(dataset=dataset_split, tokenizer=self.tokenizer, labels2idx=self.labels2idx, args=self.args)
+        y_train = torch.stack(dataset.processed_dataset["labels"]).view(-1).cpu().numpy()
+        self.loss_weights=torch.cuda.FloatTensor(compute_class_weight("balanced", np.unique(y_train), y_train))
+
+        # pretrained_lm_path = bucket_ops.get_file(
+        #     remote_path="s3://experiment-logging/storage/ner-pretraining/MLM-Loss.118725620595422d84ed3379b630a0c9/models/best_entity_lm.ckpt"
+        # )
+        # lm_args={
+        #     "lr": 3e-4,
+        #     "train_batch_size":1,
+        #     "eval_batch_size":1,
+        # }
+        # self.embeds = NERLongformer.load_from_checkpoint(pretrained_lm_path, args = lm_args).longformer
+
+
 
     def _set_global_attention_mask(self, input_ids):
         """Configure the global attention pattern based on the task"""
@@ -174,7 +258,7 @@ class NERLongformer(pl.LightningModule):
         # not a conceptual one (PyTorch 1.8.1).
         # The following line puts global attention on the <s> token to make sure all model
         # parameters which is necessery for gradient accumulation to work.
-        #global_attention_mask[:, :1] = 1
+        global_attention_mask[:, :1] = 1
 
         # # Global attention on the first 100 tokens
         # global_attention_mask[:, :100] = 1
@@ -182,45 +266,39 @@ class NERLongformer(pl.LightningModule):
         # # Global attention on periods
         # global_attention_mask[(input_ids == self.tokenizer.convert_tokens_to_ids('.'))] = 1
 
-        batch_size = input_ids.size()[0]
-        question_separators = (input_ids == 2).nonzero(as_tuple=True)
-        sep_indices_batch = [torch.masked_select(question_separators[1], torch.eq(question_separators[0], batch_num))[0] for batch_num in range(batch_size)]
-
-        for batch_num in range(batch_size):
-            global_attention_mask[batch_num, :sep_indices_batch[batch_num]]=1
-
         return global_attention_mask
 
     def forward(self, **batch): 
-        input_ids, attention_mask = batch["input_ids"], batch["attention_mask"], 
-        
-        if "start_positions" in batch.keys():
-            start, end = batch["start_positions"], batch["end_positions"]
-            outputs = self.model(input_ids=input_ids,
-                            attention_mask=attention_mask,  # mask padding tokens
-                            #global_attention_mask=self._set_global_attention_mask(input_ids),
-                            start_positions=start,
-                            end_positions=end,
-                            use_cache=False)
-        else:
-            outputs = self.model(input_ids=input_ids,
-                            attention_mask=attention_mask,  # mask padding tokens
-                            use_cache=False)
+        # input_ids, attention_mask = batch["input_ids"], batch["attention_mask"], 
 
-        # outputs = self.model(**batch)
-        # start_logits = outputs.start_logits
-        # end_logits = outputs.end_logits          
-        return outputs
+        outputs = self.model(**batch) #, global_attention_mask=self._set_global_attention_mask(batch["input_ids"]))
+        logits = outputs.logits
+        
+        loss=None
+        
+        if "labels" in batch.keys():
+            loss_fct = nn.CrossEntropyLoss(self.loss_weights, ignore_index=-100)
+            # Only keep active parts of the loss
+            if batch["attention_mask"] is not None:
+                active_loss = batch["attention_mask"].view(-1) == 1
+                active_logits = logits.view(-1, self.config.num_labels)[active_loss]
+                active_labels = batch["labels"].view(-1)[active_loss]
+                loss = loss_fct(active_logits, active_labels)
+            else:
+                loss = loss_fct(logits.view(-1, self.num_labels), batch["labels"].view(-1))
+
+        return (loss, logits)
 
     def training_step(self, batch, batch_nb):
         """Call the forward pass then return loss"""
         outputs = self.forward(**batch)
-        return {'loss': outputs.loss}
+        return {'loss': outputs[0]}
 
     def _get_dataloader(self, split_name, is_train):
         """Get training and validation dataloaders"""
         dataset_split = self.dataset[split_name]
-        dataset = NERDataset(dataset=dataset_split, tokenizer=self.tokenizer, args=self.args)
+        dataset = NERDataset(dataset=dataset_split, tokenizer=self.tokenizer, labels2idx=self.labels2idx, args=self.args)
+
         if split_name in ["val", "test"]:
             return DataLoader(dataset, batch_size=self.args.eval_batch_size, num_workers=self.args.num_workers, collate_fn=NERDataset.collate_fn)
         else:
@@ -235,31 +313,47 @@ class NERLongformer(pl.LightningModule):
     def test_dataloader(self):
         return self._get_dataloader('test', is_train=False)
 
-    def generate(self, **kwargs):
-        return self.model.generate(**kwargs)
-
     def _evaluation_step(self, split, batch, batch_nb):
         """Validaton or Testing - predict output, compare it with gold, compute rouge1, 2, L, and log result"""
-        # input_ids, attention_mask, start, end  = batch["input_ids"], batch["attention_mask"], batch["start_positions"], batch["end_positions"]
-        
-
-    # def test_epoch_end(self, outputs):
+        outputs = self.forward(**batch)
+        return {'loss': outputs[0], "logits": outputs[1]}
 
     def validation_step(self, batch, batch_nb):
-        self._evaluation_step('val', batch, batch_nb)
+        outputs = self._evaluation_step('val', batch, batch_nb)
+        preds = torch.argmax(outputs["logits"], dim=-1)
+        labels = batch["labels"]
+        return {'val_loss': outputs["loss"], "preds": preds, "labels": labels}
+
+    def validation_epoch_end(self, outputs):
+        val_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
+        val_logits = torch.stack([x["preds"] for x in outputs], dim=0).view(-1, self.tokenizer.model_max_length)
+        val_labels = torch.stack([x["labels"] for x in outputs]).view(-1, self.tokenizer.model_max_length)
+        #print(classification_report(val_logits.view(-1).cpu().detach(), val_labels.view(-1).cpu().detach()))
+        self.log("val_loss", val_loss)
 
     def test_step(self, batch, batch_nb):
-        self._evaluation_step('test', batch, batch_nb)
+        outputs = self._evaluation_step('val', batch, batch_nb)
+        preds = torch.argmax(self.softmax(outputs["logits"]), dim=-1)
+        labels = batch["labels"]
+        return {'test_loss': outputs["loss"], "preds": preds, "labels": labels}
+
+    def test_epoch_end(self, outputs):
+        test_loss = torch.stack([x["test_loss"] for x in outputs]).mean()
+        test_preds = torch.stack([x["preds"] for x in outputs], dim=0).view(-1, self.tokenizer.model_max_length)
+        test_labels = torch.stack([x["labels"] for x in outputs]).view(-1, self.tokenizer.model_max_length)
+        print(classification_report(test_preds.view(-1).cpu().detach(), test_labels.view(-1).cpu().detach()))
+
+        self.idx2labels = {key: value for value, key in self.labels2idx.items()}
+        predictions = [[(idx, self.idx2labels[tag]) for idx, tag in enumerate(doc)] for doc in test_preds.cpu().detach().tolist()]        
+        
+        focused = [[(idx, self.idx2labels[tag]) for idx, tag in enumerate(doc) if tag!="O"] for doc in test_preds.cpu().detach().tolist()]        
+
+        to_jsonl("./predictions.jsonl", focused)
+        task.upload_artifact(name='predictions', artifact_object="./predictions.jsonl")
+
 
     def configure_optimizers(self):
         """Configure the optimizer and the learning rate scheduler"""
-        # Freeze the model
-        # for idx, (name, parameters) in enumerate(self.model.named_parameters()):
-        #     if idx<6:
-        #         parameters.requires_grad=False
-        #     else:
-        #         parameters.requires_grad=True
-
         optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
         return [optimizer]
 
@@ -289,22 +383,18 @@ class NERLongformer(pl.LightningModule):
 checkpoint_callback = pl.callbacks.ModelCheckpoint(
     dirpath = "./",
     filename="best_ner_model", 
-    monitor="val_accuracy", 
-    mode="max", 
+    monitor="val_loss", 
+    mode="min", 
     save_top_k=1, 
     save_weights_only=True,
     period=5
 )
 
-# trained_model_path = bucket_ops.get_file(
-#     remote_path="s3://experiment-logging/storage/ner-pretraining/NER-LM.0b6dc1f3db3f41e1ad9c3db53bbd1b31/models/best_entity_lm.ckpt "
-#     )
-
 #trained_model_path = "best_entity_lm.ckpt"
 model = NERLongformer(args)
 #model = NERLED.load_from_checkpoint(trained_model_path, params = args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback])
-#trainer.fit(model)
+trainer.fit(model)
 results = trainer.test(model)
 print(results)
 

@@ -24,6 +24,10 @@ class LEDConstrainedGen(PreTrainedModel):
 
         self.lm_head = nn.Linear(self.config.d_model, len(self.tokenizer), bias=False)
 
+        vocab_size = len(self.tokenizer)        
+        self.weight = torch.ones(vocab_size).cuda()
+
+
 
     def _set_global_attention_mask(self, input_ids):
         """Configure the global attention pattern based on the task"""
@@ -47,6 +51,11 @@ class LEDConstrainedGen(PreTrainedModel):
 
         # # Global attention on periods
         # global_attention_mask[(input_ids == self.tokenizer.convert_tokens_to_ids('.'))] = 1
+        global_attention_mask[(input_ids == self.tokenizer.convert_tokens_to_ids('<PerpOrg>'))] = 1
+        global_attention_mask[(input_ids == self.tokenizer.convert_tokens_to_ids('<PerpInd>'))] = 1
+        global_attention_mask[(input_ids == self.tokenizer.convert_tokens_to_ids('<Victim>'))] = 1
+        global_attention_mask[(input_ids == self.tokenizer.convert_tokens_to_ids('<Target>'))] = 1
+        global_attention_mask[(input_ids == self.tokenizer.convert_tokens_to_ids('<Weapon>'))] = 1
 
         #global_attention_mask[(input_ids == self.tokenizer.sep_token_id)] = 1
         return global_attention_mask
@@ -173,6 +182,8 @@ class LEDConstrainedGen(PreTrainedModel):
         input_embeds=None,
         task=-1):
 
+        self.weight[self.tokenizer.cls_token_id] = 100
+
         # generation
         if task==-1:
             
@@ -201,12 +212,8 @@ class LEDConstrainedGen(PreTrainedModel):
             last_cross_attentions = outputs.cross_attentions[-1] 
             cross_attentions_aggregate = last_cross_attentions[:,self.selected_heads,:,:].mean(dim=1)
 
-            # ipdb.set_trace()
-
             decoder_output = outputs.last_hidden_state #(batch, seq_len, hidden_dim)
             encoder_output = outputs.encoder_last_hidden_state # (batch, input_seq_len, hidden_dim)
-            # lm_logits = F.linear(decoder_output, self.transformer.shared.weight, bias=self.final_logits_bias)
-            # lm_logits = self.remove_unseen(lm_logits, input_ids)
 
             lm_logits = self.lm_head(decoder_output) 
 
@@ -219,7 +226,7 @@ class LEDConstrainedGen(PreTrainedModel):
             p_gen = torch.bmm(decoder_output, encoder_output.mean(dim=1).unsqueeze(dim=-1)) # (batch, decoding_seq, 1)
             p_gen = torch.sigmoid(p_gen)
             lm_logits = F.softmax(lm_logits, dim=-1) * p_gen + copy_logits * (1 - p_gen)
-            
+
             ###############################################################
 
             # decoder_output = outputs[0] #(batch, seq_len, hidden_dim)
@@ -268,11 +275,10 @@ class LEDConstrainedGen(PreTrainedModel):
             #past_key_values=past_key_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            #global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
+            global_attention_mask=self._set_global_attention_mask(input_ids),  # set global attention
             return_dict=return_dict,)
             
             ###################### COPY MECHANISM ################
-
             cross_attention_non_linear = self.transformer.decoder.layers[-1].encoder_attn.out_proj.weight
             cross_attention_non_linear_sum = cross_attention_non_linear.view(self.config.decoder_attention_heads, -1).abs().sum(1)
             _, selected_heads = torch.topk(cross_attention_non_linear_sum, k=6)
@@ -283,8 +289,6 @@ class LEDConstrainedGen(PreTrainedModel):
 
             decoder_output = outputs.last_hidden_state #(batch, seq_len, hidden_dim)
             encoder_output = outputs.encoder_hidden_states[-1] # (batch, input_seq_len, hidden_dim)
-            # lm_logits = F.linear(decoder_output, self.transformer.shared.weight, bias=self.final_logits_bias)
-            # lm_logits = self.remove_unseen(lm_logits, input_ids)
 
             lm_logits = self.lm_head(decoder_output) 
 
@@ -293,13 +297,26 @@ class LEDConstrainedGen(PreTrainedModel):
             copy_logits.scatter_add_(dim=2, index=dummy_input_ids, src=cross_attentions_aggregate)
             
             p_gen = torch.bmm(decoder_output, encoder_output.mean(dim=1).unsqueeze(dim=-1)) # (batch, decoding_seq, 1)
+
             p_gen = torch.sigmoid(p_gen)
             lm_logits = F.softmax(lm_logits, dim=-1) * p_gen + copy_logits * (1 - p_gen)
             
+            masked_lm_loss = None
+            if labels is not None:
+                # compute loss mask and fill -100 with 0
+                loss_mask = labels != -100
+                labels.masked_fill_(~loss_mask, 0)
+                # use negative log likelihood
+                gold_probs = torch.gather(lm_logits, 2, labels.unsqueeze(2)).squeeze(2)
+                eps = 1e-7 # for safe log
+                masked_lm_loss = - torch.log(gold_probs + eps) #* self.weight[labels]
+                masked_lm_loss = (masked_lm_loss * loss_mask).mean()
+
             ######################################################
-            # ipdb.set_trace()        
 
             # # get encoder side embeddings 
+            # lm_logits = F.linear(decoder_output, self.transformer.shared.weight, bias=self.final_logits_bias)
+            # lm_logits = self.remove_unseen(lm_logits, input_ids)
             # input_embeds = self.transformer.encoder.embed_tokens(input_ids) #* self.transformer.encoder.embed_scale #(batch, seq_len, input_seq_len)
             # pointer_logits = torch.einsum('ijk,ilk->ijl', decoder_output, input_embeds) #(batch, seq_len, input_seq_len)
             # # decrease <arg> prob if neccesary 
@@ -308,10 +325,10 @@ class LEDConstrainedGen(PreTrainedModel):
             # outputs = (lm_logits,) + outputs[1:]  # Add cache, hidden states and attention if they are here
 
             #loss_fct = nn.NLLLoss(ignore_index=-100) 
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            masked_lm_loss = loss_fct(lm_logits.view(-1, self.vocab_size), labels.view(-1))
-            outputs = (masked_lm_loss,) + (lm_logits,)
+            # loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            # masked_lm_loss = loss_fct(lm_logits.view(-1, self.vocab_size), labels.view(-1))
 
+            outputs = (masked_lm_loss,) + (lm_logits,)
             return outputs
 
 
