@@ -37,14 +37,14 @@ config = {
 "attention_window": 256,
 "num_epochs": 10,
 "use_entity_embeddings": False,
-"model_name": "allenai/longformer-base-4096",
-#"model_name": "mrm8488/longformer-base-4096-finetuned-squadv2",  
+#"model_name": "allenai/longformer-base-4096",
+"model_name": "mrm8488/longformer-base-4096-finetuned-squadv2",  
 "debug": False
 }
 #json.load(open('config.json'))
 
 args = argparse.Namespace(**config)
-task = Task.init(project_name='LangGen', task_name='MRC-NER', output_uri="s3://experiment-logging/storage/")
+task = Task.init(project_name='LangGen', task_name='MRC-NER-SQUADRAW', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
 task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
@@ -414,7 +414,7 @@ class NERLongformerQA(pl.LightningModule):
     def _get_dataloader(self, split_name, is_train):
         """Get training and validation dataloaders"""
         if self.args.debug:
-            dataset_split = self.dataset[split_name][:25]
+            dataset_split = self.dataset[split_name]
         else:
             dataset_split = self.dataset[split_name]
 
@@ -517,7 +517,7 @@ class NERLongformerQA(pl.LightningModule):
         pred_list = []
 
         logs={}
-        doctexts_tokens, golds = read_golds_from_test_file(os.path.join(dataset_folder, "data/muc4-grit/processed/"), self.tokenizer)[:25]
+        doctexts_tokens, golds = read_golds_from_test_file(os.path.join(dataset_folder, "data/muc4-grit/processed/"), self.tokenizer)
         
         if self.args.debug:
             golds = {key:golds[key] for idx, key in enumerate(golds.keys()) if idx<10}
@@ -629,12 +629,18 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
     period=5
 )
 
-trained_model_path = bucket_ops.get_file(
-            remote_path="s3://experiment-logging/storage/LangGen/promptNER-QA-Base.7ffa23a05839464980272aa317353fc3/models/best_ner_model.ckpt"
-            )
+#base
+# trained_model_path = bucket_ops.get_file(
+#             remote_path="s3://experiment-logging/storage/LangGen/promptNER-QA-Base.7ffa23a05839464980272aa317353fc3/models/best_ner_model.ckpt"
+#             )
 
-#model = NERLongformerQA(args)
-model = NERLongformerQA.load_from_checkpoint(trained_model_path, params = args)
+#squad-finetune
+# trained_model_path = bucket_ops.get_file(
+#             remote_path="s3://experiment-logging/storage/LangGen/promptNER-QA-Squad.2bfce82a26464e37a945c4696a8036f6/models/best_ner_model.ckpt"
+#             )
+
+#model = NERLongformerQA.load_from_checkpoint(trained_model_path, params = args)
+model = NERLongformerQA(args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback])
 #trainer.fit(model)
 results = trainer.test(model)

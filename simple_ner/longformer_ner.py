@@ -3,6 +3,8 @@ from clearml import Task, StorageManager, Dataset
 import argparse
 import json, os, ipdb
 import jsonlines
+from collections import OrderedDict
+from eval import eval_ceaf
 
 config = json.load(open('config.json'))
 args = argparse.Namespace(**config)
@@ -40,6 +42,10 @@ class bucket_ops:
 
     def upload_file(local_path:str, remote_path:str):
         StorageManager.upload_file(local_path, remote_path, wait_for_upload=True, retries=3)
+
+
+def remove_led_prefix_from_tokens(tokens:list):
+    return [token[1:] if 'Ġ' in token else token for token in tokens]
 
 # #Download Pretrained Models
 # bucket_ops.download_folder(
@@ -204,6 +210,31 @@ from transformers import AutoTokenizer, AutoModelForTokenClassification
 from sklearn.utils.class_weight import compute_class_weight
 import numpy as np
 
+
+def read_golds_from_test_file(data_dir, tokenizer):
+    golds = OrderedDict()
+    doctexts_tokens = OrderedDict()
+    file_path = os.path.join(data_dir, "test.json")
+    with open(file_path, encoding="utf-8") as f:
+        for line in f:
+            line = json.loads(line)
+            docid=line["docid"]
+            #docid = int(line["docid"].split("-")[0][-1])*10000 + int(line["docid"].split("-")[-1]) # transform TST1-MUC3-0001 to int(0001)
+            doctext, extracts_raw = line["doctext"], line["extracts"]
+
+            extracts = OrderedDict()
+            for role, entitys_raw in extracts_raw.items():
+                extracts[role] = []
+                for entity_raw in entitys_raw:
+                    entity = []
+                    for mention_offset_pair in entity_raw:
+                        entity.append(mention_offset_pair[0])
+                    if entity:
+                        extracts[role].append(entity)
+            doctexts_tokens[docid] = tokenizer.tokenize(doctext)
+            golds[docid] = extracts
+    return doctexts_tokens, golds
+
 class NERLongformer(pl.LightningModule):
     """Pytorch Lightning module. It wraps up the model, data loading and training code"""
     def __init__(self, params):
@@ -231,9 +262,12 @@ class NERLongformer(pl.LightningModule):
         y_train = torch.stack(dataset.processed_dataset["labels"]).view(-1).cpu().numpy()
         self.loss_weights=torch.cuda.FloatTensor(compute_class_weight("balanced", np.unique(y_train), y_train))
 
+        self.test_doc_ids = [doc["docid"] for doc in self.dataset["test"]]
+
         # pretrained_lm_path = bucket_ops.get_file(
         #     remote_path="s3://experiment-logging/storage/ner-pretraining/MLM-Loss.118725620595422d84ed3379b630a0c9/models/best_entity_lm.ckpt"
         # )
+
         # lm_args={
         #     "lr": 3e-4,
         #     "train_batch_size":1,
@@ -335,20 +369,91 @@ class NERLongformer(pl.LightningModule):
         outputs = self._evaluation_step('val', batch, batch_nb)
         preds = torch.argmax(self.softmax(outputs["logits"]), dim=-1)
         labels = batch["labels"]
-        return {'test_loss': outputs["loss"], "preds": preds, "labels": labels}
+        return {'test_loss': outputs["loss"], "preds": preds, "labels": labels, "tokens": batch["input_ids"]}
 
     def test_epoch_end(self, outputs):
+
+        logs={}
+        doctexts_tokens, golds = read_golds_from_test_file(os.path.join(dataset_folder, "data/muc4-grit/processed/"), self.tokenizer)
+
         test_loss = torch.stack([x["test_loss"] for x in outputs]).mean()
         test_preds = torch.stack([x["preds"] for x in outputs], dim=0).view(-1, self.tokenizer.model_max_length)
         test_labels = torch.stack([x["labels"] for x in outputs]).view(-1, self.tokenizer.model_max_length)
-        print(classification_report(test_preds.view(-1).cpu().detach(), test_labels.view(-1).cpu().detach()))
+
+        tokens = torch.stack([x["tokens"] for x in outputs]).view(-1, self.tokenizer.model_max_length).cpu().detach().tolist()
+        tokens = [self.tokenizer.convert_ids_to_tokens(token) for token in tokens]
+        print(classification_report(test_preds.view(-1).cpu().detach(), test_labels.view(-1).cpu().detach(), target_names=[key for key in self.labels2idx.keys()]))       
 
         self.idx2labels = {key: value for value, key in self.labels2idx.items()}
         predictions = [[(idx, self.idx2labels[tag]) for idx, tag in enumerate(doc)] for doc in test_preds.cpu().detach().tolist()]        
-        
-        focused = [[(idx, self.idx2labels[tag]) for idx, tag in enumerate(doc) if tag!="O"] for doc in test_preds.cpu().detach().tolist()]        
 
-        to_jsonl("./predictions.jsonl", focused)
+        # Filter out "O" tags       
+        focused = [[(idx, self.idx2labels[tag]) for idx, tag in enumerate(doc) if self.idx2labels[tag]!="O"] for doc in test_preds.cpu().detach().tolist()]        
+
+        doc_span_list = []
+
+        # Convert valid BIO tags to spans
+        for doc in focused:
+            span_list = []
+            spans = []
+            for tag in doc:
+                idx = tag[0]
+                prefix = tag[1][:2]
+                classname = tag[1][2:]
+                if prefix=="B-":
+                    if len(spans)>0:
+                        span_list.append(spans)
+                        spans=[]
+                    spans.append(tag)
+                elif prefix=="I-" and len(spans)>0 and classname==spans[0][1][2:] and spans[-1][0]==idx-1:
+                    spans.append(tag)
+                else:                    
+                    pass
+
+            if len(spans)>0:
+                span_list.append(spans)
+
+            # Append (start_idx, end_idx, classname) into span_list
+            span_list = [[span[0][0], span[-1][0], span[0][1][2:]] for span in span_list]
+            doc_span_list.append(span_list)
+
+        # Convert spans to MUC-4 template
+        muc4_pred_format = [{key: [] for key in role_map.keys()} for i in range(len(doc_span_list))]
+        for idx, (span_list, doc) in enumerate(zip(doc_span_list, tokens)):
+            for span in span_list:
+                #muc4_pred_format[idx][span[-1]].append(' '.join(remove_led_prefix_from_tokens(doc[span[0]:span[1]+1])))
+                muc4_pred_format[idx][span[-1]].append(self.tokenizer.convert_tokens_to_string(doc[span[0]:span[1]+1]))
+
+        preds = OrderedDict()
+        for key, doc in zip(self.test_doc_ids, muc4_pred_format):
+            if key not in preds:
+                preds[key] = OrderedDict()
+                for idx, role in enumerate(role_map.keys()):
+                    preds[key][role] = []
+                    if idx+1 > len(doc): 
+                        continue
+                    elif doc[role]:
+                        for mention in doc[role]:
+                            if mention=="</s>" or mention=="<s>":
+                                continue
+                            else:    
+                                preds[key][role].append([mention])                
+
+        results = eval_ceaf(preds, golds)
+        print("================= CEAF score =================")
+        print("phi_strict: P: {:.2f}%,  R: {:.2f}%, F1: {:.2f}%".format(results["strict"]["micro_avg"]["p"] * 100, results["strict"]["micro_avg"]["r"] * 100, results["strict"]["micro_avg"]["f1"] * 100))
+        print("phi_prop: P: {:.2f}%,  R: {:.2f}%, F1: {:.2f}%".format(results["prop"]["micro_avg"]["p"] * 100, results["prop"]["micro_avg"]["r"] * 100, results["prop"]["micro_avg"]["f1"] * 100))
+        print("==============================================")
+
+        logs["test_micro_avg_f1_phi_strict"] = results["strict"]["micro_avg"]["f1"]
+        logs["test_micro_avg_precision_phi_strict"] = results["strict"]["micro_avg"]["p"]
+        logs["test_micro_avg_recall_phi_strict"] = results["strict"]["micro_avg"]["r"]
+
+        clearlogger.report_scalar(title='f1', series = 'test', value=logs["test_micro_avg_f1_phi_strict"], iteration=1) 
+        clearlogger.report_scalar(title='precision', series = 'test', value=logs["test_micro_avg_precision_phi_strict"], iteration=1) 
+        clearlogger.report_scalar(title='recall', series = 'test', value=logs["test_micro_avg_recall_phi_strict"], iteration=1) 
+
+        to_jsonl("./predictions.jsonl", preds)
         task.upload_artifact(name='predictions', artifact_object="./predictions.jsonl")
 
 
@@ -390,11 +495,13 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
     period=5
 )
 
-#trained_model_path = "best_entity_lm.ckpt"
+# trained_model_path = bucket_ops.get_file(
+#             remote_path="s3://experiment-logging/storage/LongformerNER/simpleTokenClassification.edbb72eee67242278f0ff658fd16f61e/models/best_ner_model.ckpt"
+#             )
+#model = NERLongformer.load_from_checkpoint(trained_model_path, params = args)
+
 model = NERLongformer(args)
-#model = NERLED.load_from_checkpoint(trained_model_path, params = args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback])
 trainer.fit(model)
 results = trainer.test(model)
-print(results)
 

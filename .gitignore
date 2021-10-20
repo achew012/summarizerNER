@@ -5,3 +5,5 @@ gen-arg/lightning_logs
 gen-arg/__pycache__
 qa/lightning_logs
 qa/__pycache__
+simple_ner/lightning_logs
+simple_ner/__pycache__
