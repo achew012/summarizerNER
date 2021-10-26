@@ -5,17 +5,6 @@ import jsonlines
 import ipdb
 from collections import OrderedDict
 
-def read_json(jsonfile):
-    with open(jsonfile, 'rb') as file:
-        file_object = [json.loads(sample) for sample in file]
-    return file_object
-
-''' Writes to a jsonl file'''
-def to_jsonl(filename:str, file_obj):
-    resultfile = open(filename, 'wb')
-    writer = jsonlines.Writer(resultfile)
-    writer.write_all(file_obj)
-
 config = {
 "seed": 1234, 
 "lr": 1e-04, 
@@ -28,23 +17,24 @@ config = {
 "data_dir": "/data",
 "output_dir": "./saved_models/test", 
 "val_every": 0.33, 
-"max_input_len": 2048, 
+"max_input_len": 470, 
 "batch_size": 4, 
 "eval_batch_size": 4, 
 "grad_accum": 1, 
 "fp16": False, 
 "grad_ckpt": True, 
 "attention_window": 256,
-"num_epochs": 10,
-"use_entity_embeddings": False,
-#"model_name": "allenai/longformer-base-4096",
-"model_name": "mrm8488/longformer-base-4096-finetuned-squadv2",  
+"num_epochs": 15,
+"use_entity_embeddings": True,
+"embedding_path":"s3://experiment-logging/storage/ner-pretraining/EntitySpanPretraining.16fec40c8a0e4198b97b231f8cdfcb7f/models/best_entity_lm.ckpt",
+"model_name": "allenai/longformer-base-4096",
+#"model_name": "mrm8488/longformer-base-4096-finetuned-squadv2",  
 "debug": False
 }
 #json.load(open('config.json'))
 
 args = argparse.Namespace(**config)
-task = Task.init(project_name='LangGen', task_name='MRC-NER-SQUADRAW', output_uri="s3://experiment-logging/storage/")
+task = Task.init(project_name='LangGen', task_name='MRC-NER-PRETRAINEDSPANS-mlm+span_loss', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
 task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
@@ -82,6 +72,12 @@ class bucket_ops:
 dataset = Dataset.get(dataset_name="muc4-processed", dataset_project="datasets/muc4", dataset_tags=["processed", "GRIT"], only_published=True)
 dataset_folder = dataset.get_local_copy()
 print(list(os.walk(os.path.join(dataset_folder, "data/muc4-grit/processed"))))
+
+''' Writes to a jsonl file'''
+def to_jsonl(filename:str, file_obj):
+    resultfile = open(filename, 'wb')
+    writer = jsonlines.Writer(resultfile)
+    writer.write_all(file_obj)
 
 def read_json(jsonfile):
     with open(jsonfile, 'rb') as file:
@@ -137,6 +133,8 @@ class NERDataset(Dataset):
             "end": []
         }
 
+        overflow_count = 0
+
         for doc in dataset:
             docid = doc["docid"]
             context = doc["doctext"] #self.tokenizer.decode(self.tokenizer.encode(doc["doctext"]))
@@ -147,7 +145,7 @@ class NERDataset(Dataset):
             #qns_ans = [["who are the {} entities?".format(role_map[key].lower()), mention[1] if len(mention)>0 else 0, mention[1]+len(mention[0]) if len(mention)>0 else 0, mention[0] if len(mention)>0 else ""] for key in doc["extracts"].keys() for cluster in doc["extracts"][key] for mention in cluster]    
 
             for qns, ans_char_start, ans_char_end, mention in qns_ans:
-                context_encodings = self.tokenizer(qns, context, padding="max_length", truncation=True, max_length=1024, return_offsets_mapping=True, return_tensors="pt")
+                context_encodings = self.tokenizer(qns, context, padding="max_length", truncation=True, max_length=args.max_input_len, return_offsets_mapping=True, return_tensors="pt")
                 sequence_ids = context_encodings.sequence_ids()
 
                 # Detect if the answer is out of the span (in which case this feature is labeled with the CLS index).
@@ -155,7 +153,9 @@ class NERDataset(Dataset):
                 pad_start_idx = sequence_ids[sequence_ids.index(1):].index(None)
                 offsets_wo_pad = context_encodings["offset_mapping"][0][qns_offset:pad_start_idx]
 
+                # if char indices more than end idx in last word span
                 if ans_char_end>offsets_wo_pad[-1][1] or ans_char_start>offsets_wo_pad[-1][1]:
+                    overflow_count+=1
                     ans_char_start = 0
                     ans_char_end = 0
 
@@ -173,7 +173,7 @@ class NERDataset(Dataset):
                 
                 # If token span is incomplete
                 if len(token_span)<2:
-                    import ipdb; ipdb.set_trace()
+                    ipdb.set_trace()
 
                 # print("span: ", tokenizer.decode(context_encodings["input_ids"][0][token_span[0]+qns_offset:token_span[1]+1+qns_offset]))
                 # print("mention: ", mention)
@@ -187,6 +187,9 @@ class NERDataset(Dataset):
                 self.processed_dataset["start"].append(token_span[0]+qns_offset)
                 self.processed_dataset["end"].append(token_span[1]+qns_offset+1)
 
+            # ipdb.set_trace()
+
+        print("OVERFLOW COUNT: ", overflow_count)
 
     def __len__(self):
         """Returns length of the dataset"""
@@ -307,27 +310,33 @@ class NERLongformerQA(pl.LightningModule):
         # Load and update config then load a pretrained LEDForConditionalGeneration
         self.config = AutoConfig.from_pretrained(self.args.model_name)
         self.config.gradient_checkpointing = True
-        self.model = AutoModelForQuestionAnswering.from_pretrained(self.args.model_name, config=self.config)
         # Load tokenizer and metric
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.model_name, use_fast=True)
+        self.model = AutoModelForQuestionAnswering.from_pretrained(self.args.model_name, config=self.config)
 
         # Use pretrained embeddings
         if self.args.use_entity_embeddings:
 
             pretrained_lm_path = bucket_ops.get_file(
-                remote_path="s3://experiment-logging/storage/ner-pretraining/MLM-Loss.118725620595422d84ed3379b630a0c9/models/best_entity_lm.ckpt"
+                remote_path=self.args.embedding_path
             )
 
-            # pretrained_lm_path = "./best_entity_lm.ckpt"
-
             lm_args={
-                "lr": 3e-4,
-                "train_batch_size":1,
+                "lr": 5e-4,
+                "num_epochs":5,
+                "train_batch_size":12,
                 "eval_batch_size":1,
+                "max_length": 2048, # be mindful underlength will cause device cuda side error
+                "max_span_len": 15,
+                "max_spans": 25,
+                "mlm_task": False,
+                "bio_task": True,
             }
+            lm_args = argparse.Namespace(**lm_args)
 
-            self.longformer = NERLongformer.load_from_checkpoint(pretrained_lm_path, args = lm_args).longformer
-
+            # WARNING different longformer models have different calls
+            #self.model.longformer = NERLongformer.load_from_checkpoint(pretrained_lm_path, args = lm_args).longformerMLM
+            self.model.longformer = NERLongformer.load_from_checkpoint(pretrained_lm_path, args = lm_args).longformer
 
     def _set_global_attention_mask(self, input_ids):
         """Configure the global attention pattern based on the task"""
@@ -368,33 +377,13 @@ class NERLongformerQA(pl.LightningModule):
         if "start_positions" in batch.keys():
             start, end = batch["start_positions"], batch["end_positions"]
 
-            if self.args.use_entity_embeddings:
-                input_embeds = self.longformer(input_ids=input_ids, output_hidden_states=True)
-                input_embeds = torch.mean(torch.stack(input_embeds[1][-4:]), dim=0) # (bs, seqlen, emb dim)
-
-                outputs = self.model(
-                                inputs_embeds = input_embeds,
-                                attention_mask=attention_mask,  # mask padding tokens
-                                global_attention_mask=self._set_global_attention_mask(input_ids),
-                                start_positions=start,
-                                end_positions=end
-                                )
-            else:
-                outputs = self.model(
-                                input_ids=input_ids,
-                                #inputs_embeds = input_embeds[1][-1],
-                                attention_mask=attention_mask,  # mask padding tokens
-                                global_attention_mask=self._set_global_attention_mask(input_ids),
-                                start_positions=start,
-                                end_positions=end
-                                )
-        elif self.args.use_entity_embeddings:
-            input_embeds = self.longformer(input_ids=input_ids, output_hidden_states=True)
-            input_embeds = torch.mean(torch.stack(input_embeds[1][-4:]), dim=0) # (bs, seqlen, emb dim)
             outputs = self.model(
-                inputs_embeds = input_embeds,
-                attention_mask=attention_mask  # mask padding tokens
-            )
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,  # mask padding tokens
+                            global_attention_mask=self._set_global_attention_mask(input_ids),
+                            start_positions=start,
+                            end_positions=end
+                            )
         else:
             outputs = self.model(
                 input_ids=input_ids,
@@ -425,12 +414,15 @@ class NERLongformerQA(pl.LightningModule):
             return DataLoader(dataset, batch_size=self.args.batch_size, num_workers=self.args.num_workers, collate_fn=NERDataset.collate_fn)
 
     def train_dataloader(self):
+        print("train")
         return self._get_dataloader('train', is_train=True)
 
     def val_dataloader(self):
+        print("val")
         return self._get_dataloader('val', is_train=False)
 
     def test_dataloader(self):
+        print("test")
         return self._get_dataloader('test', is_train=False)
 
     def generate(self, **kwargs):
@@ -582,9 +574,9 @@ class NERLongformerQA(pl.LightningModule):
 
     def configure_optimizers(self):
         """Configure the optimizer and the learning rate scheduler"""
-        if self.args.use_entity_embeddings: 
-            for (_, parameters) in self.longformer.named_parameters():
-                parameters.requires_grad=False 
+        # if self.args.use_entity_embeddings: 
+        #     for (_, parameters) in self.longformer.named_parameters():
+        #         parameters.requires_grad=False 
 
         # Freeze the model
         # for idx, (name, parameters) in enumerate(self.model.named_parameters()):
@@ -639,8 +631,12 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
 #             remote_path="s3://experiment-logging/storage/LangGen/promptNER-QA-Squad.2bfce82a26464e37a945c4696a8036f6/models/best_ner_model.ckpt"
 #             )
 
+# trained_model_path = bucket_ops.get_file(
+#             remote_path="s3://experiment-logging/storage/LangGen/MRC-NER-PRETRAINSSPANS.962f18a7e03b4c99a18972f53b667d42/models/best_ner_model.ckpt"
+#             )
+
 #model = NERLongformerQA.load_from_checkpoint(trained_model_path, params = args)
 model = NERLongformerQA(args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback])
-#trainer.fit(model)
+trainer.fit(model)
 results = trainer.test(model)

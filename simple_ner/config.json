@@ -18,5 +18,7 @@
 "grad_ckpt": true, 
 "attention_window": 512,
 "num_epochs": 30,
-"model": "allenai/led-base-16384"
+"model": "allenai/led-base-16384",
+"use_entity_embeddings": true,
+"embedding_path": "s3://experiment-logging/storage/ner-pretraining/EntitySpanPretraining.23b6823fcbb9473c901281fc8ad241cb/models/best_entity_lm.ckpt"
 } 

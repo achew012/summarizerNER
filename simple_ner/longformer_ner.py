@@ -208,6 +208,7 @@ class NERDataset(Dataset):
 ####################################################################################################################
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 from sklearn.utils.class_weight import compute_class_weight
+from pretrain import PretrainedModel
 import numpy as np
 
 
@@ -264,17 +265,27 @@ class NERLongformer(pl.LightningModule):
 
         self.test_doc_ids = [doc["docid"] for doc in self.dataset["test"]]
 
-        # pretrained_lm_path = bucket_ops.get_file(
-        #     remote_path="s3://experiment-logging/storage/ner-pretraining/MLM-Loss.118725620595422d84ed3379b630a0c9/models/best_entity_lm.ckpt"
-        # )
+        if self.args.use_entity_embeddings:
 
-        # lm_args={
-        #     "lr": 3e-4,
-        #     "train_batch_size":1,
-        #     "eval_batch_size":1,
-        # }
-        # self.embeds = NERLongformer.load_from_checkpoint(pretrained_lm_path, args = lm_args).longformer
+            pretrained_lm_path = bucket_ops.get_file(
+                remote_path=self.args.embedding_path
+            )
 
+            lm_args={
+                "lr": 5e-4,
+                "num_epochs":5,
+                "train_batch_size":12,
+                "eval_batch_size":1,
+                "max_length": 2048, # be mindful underlength will cause device cuda side error
+                "max_span_len": 15,
+                "max_spans": 25,
+                "mlm_task": False,
+                "bio_task": True,
+            }
+            lm_args = argparse.Namespace(**lm_args)
+
+            # WARNING different longformer models have different calls
+            self.model.longformer = PretrainedModel.load_from_checkpoint(pretrained_lm_path, args = lm_args).longformer
 
 
     def _set_global_attention_mask(self, input_ids):

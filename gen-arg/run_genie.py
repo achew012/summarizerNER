@@ -77,6 +77,7 @@ def read_json(jsonfile):
 train_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/train.json"))
 dev_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/dev.json"))
 test_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/test.json"))
+
 muc4 = {
     "train": train_data,
     "val": dev_data,

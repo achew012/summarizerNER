@@ -16,7 +16,7 @@ from sklearn.metrics import classification_report, precision_recall_fscore_suppo
 
 from typing import Callable, List, Set, Tuple, TypeVar, Optional
 
-class NERLongformer(pl.LightningModule):
+class PretrainedModel(pl.LightningModule):
     def __init__(self, args):
         super().__init__()
         self.args = args
