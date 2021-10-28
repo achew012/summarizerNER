@@ -17,7 +17,7 @@ config = {
 "data_dir": "/data",
 "output_dir": "./saved_models/test", 
 "val_every": 0.33, 
-"max_input_len": 2048, 
+"max_input_len": 470, 
 "batch_size": 4, 
 "eval_batch_size": 4, 
 "grad_accum": 1, 
@@ -26,7 +26,7 @@ config = {
 "attention_window": 256,
 "num_epochs": 15,
 "use_entity_embeddings": True,
-"embedding_path":"s3://experiment-logging/storage/ner-pretraining/EntitySpanClassifier.af706f110ce84e189eb5d59c623a571d/models/best_entity_lm.ckpt",
+"embedding_path":"s3://experiment-logging/storage/ner-pretraining/EntitySpanPretraining.16fec40c8a0e4198b97b231f8cdfcb7f/models/best_entity_lm.ckpt",
 "model_name": "allenai/longformer-base-4096",
 #"model_name": "mrm8488/longformer-base-4096-finetuned-squadv2",  
 "debug": False
@@ -37,9 +37,9 @@ args = argparse.Namespace(**config)
 task = Task.init(project_name='LangGen', task_name='MRC-NER-PRETRAINEDSPANS-mlm+span_loss', output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
-task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
-task.connect(args)
-task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+# task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+# task.connect(args)
+# task.execute_remotely(queue_name="128RAMv100", exit_process=True)
 
 class bucket_ops:
     StorageManager.set_cache_file_limit(5, cache_context=None)
@@ -144,10 +144,6 @@ class NERDataset(Dataset):
             ### expand on all labels in each role
             #qns_ans = [["who are the {} entities?".format(role_map[key].lower()), mention[1] if len(mention)>0 else 0, mention[1]+len(mention[0]) if len(mention)>0 else 0, mention[0] if len(mention)>0 else ""] for key in doc["extracts"].keys() for cluster in doc["extracts"][key] for mention in cluster]    
 
-            # labels = [self.labels2idx["O"]]*(self.tokenizer.model_max_length)
-            # length_of_sequence = len(self.tokenizer.tokenize(context)) if len(self.tokenizer.tokenize(context))<=len(labels) else len(labels)           
-            # labels[:length_of_sequence] = [self.labels2idx["O"]]*length_of_sequence            
-
             for qns, ans_char_start, ans_char_end, mention in qns_ans:
                 context_encodings = self.tokenizer(qns, context, padding="max_length", truncation=True, max_length=args.max_input_len, return_offsets_mapping=True, return_tensors="pt")
                 sequence_ids = context_encodings.sequence_ids()
@@ -182,12 +178,6 @@ class NERDataset(Dataset):
                 # print("span: ", tokenizer.decode(context_encodings["input_ids"][0][token_span[0]+qns_offset:token_span[1]+1+qns_offset]))
                 # print("mention: ", mention)
 
-                # if token_span!=[0,0]:
-                #     labels[token_span[0]:token_span[0]+1] = [self.labels2idx["B-"+qns]]
-                #     if len(labels[token_span[0]+1:token_span[1]+1])>0 and (token_span[1]-token_span[0])>0:
-                #         labels[token_span[0]+1:token_span[1]+1] = [self.labels2idx["I-"+qns]]*(token_span[1]-token_span[0])
-
-
                 self.processed_dataset["docid"].append(docid)
                 self.processed_dataset["context"].append(context)
                 self.processed_dataset["input_ids"].append(context_encodings["input_ids"].squeeze(0))
@@ -196,9 +186,6 @@ class NERDataset(Dataset):
                 self.processed_dataset["gold_mentions"].append(mention)
                 self.processed_dataset["start"].append(token_span[0]+qns_offset)
                 self.processed_dataset["end"].append(token_span[1]+qns_offset+1)
-
-            # self.processed_dataset["labels"].append(torch.tensor(labels))
-
 
             # ipdb.set_trace()
 
@@ -343,14 +330,13 @@ class NERLongformerQA(pl.LightningModule):
                 "max_span_len": 15,
                 "max_spans": 25,
                 "mlm_task": False,
-                "bio_task": False,
+                "bio_task": True,
             }
             lm_args = argparse.Namespace(**lm_args)
 
             # WARNING different longformer models have different calls
             #self.model.longformer = NERLongformer.load_from_checkpoint(pretrained_lm_path, args = lm_args).longformerMLM
-            #self.model.longformer = NERLongformer.load_from_checkpoint(pretrained_lm_path, args = lm_args).longformer
-            self.span_embeds = NERLongformer.load_from_checkpoint(pretrained_lm_path, args = lm_args).longformer
+            self.model.longformer = NERLongformer.load_from_checkpoint(pretrained_lm_path, args = lm_args).longformer
 
     def _set_global_attention_mask(self, input_ids):
         """Configure the global attention pattern based on the task"""
@@ -388,23 +374,20 @@ class NERLongformerQA(pl.LightningModule):
     def forward(self, **batch): 
         input_ids, attention_mask = batch["input_ids"], batch["attention_mask"], 
 
-        span_embeds = self.span_embeds(input_ids, attention_mask).last_hidden_state
-
-        inputs_embeds = torch.sum(torch.stack([self.model.longformer.embeddings(input_ids), span_embeds], dim=0), dim=0)
-
         if "start_positions" in batch.keys():
             start, end = batch["start_positions"], batch["end_positions"]
-            self.model.longformer.embeddings(input_ids)
 
             outputs = self.model(
-                            #input_ids=input_ids,
-                            inputs_embeds = inputs_embeds,
+                            input_ids=input_ids,
                             attention_mask=attention_mask,  # mask padding tokens
                             global_attention_mask=self._set_global_attention_mask(input_ids),
                             start_positions=start,
                             end_positions=end,
                             output_hidden_states=True,
                             )
+            
+            #outputs.hidden_states[-1]
+            # ipdb.set_trace()
 
         else:
             outputs = self.model(
@@ -597,9 +580,9 @@ class NERLongformerQA(pl.LightningModule):
 
     def configure_optimizers(self):
         """Configure the optimizer and the learning rate scheduler"""
-        if self.args.use_entity_embeddings: 
-            for (_, parameters) in self.span_embeds.named_parameters():
-                parameters.requires_grad=False 
+        # if self.args.use_entity_embeddings: 
+        #     for (_, parameters) in self.longformer.named_parameters():
+        #         parameters.requires_grad=False 
 
         # Freeze the model
         # for idx, (name, parameters) in enumerate(self.model.named_parameters()):

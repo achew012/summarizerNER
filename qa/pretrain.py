@@ -28,7 +28,8 @@ class NERLongformer(pl.LightningModule):
         # self.longformer = LongformerForMaskedLM.from_pretrained('allenai/longformer-base-4096', output_hidden_states=True)
 
         self.longformer = LongformerModel(self.config)
-        self.lm_head = LongformerLMHead(self.config) 
+        if self.args.mlm_task:
+            self.lm_head = LongformerLMHead(self.config) 
 
         # train_data = DWIE_Data(dwie["train"], self.tokenizer, self.class2id, self.args)
         # y_train = torch.stack([doc["bio_labels"] for doc in train_data.consolidated_dataset]).view(-1).cpu().numpy()
@@ -46,17 +47,17 @@ class NERLongformer(pl.LightningModule):
         )
         self.size_embeddings = nn.Embedding(self.args.max_span_len, self.config.hidden_size)
         
-    def val_dataloader(self):
-        val = dwie["test"]
-        val_data = DWIE_Data(val, self.tokenizer, self.args)
-        val_dataloader = DataLoader(val_data, batch_size=self.args.eval_batch_size, collate_fn = val_data.collate_fn)
-        return val_dataloader
+    # def val_dataloader(self):
+    #     val = dwie["test"]
+    #     val_data = DWIE_Data(val, self.tokenizer, self.args)
+    #     val_dataloader = DataLoader(val_data, batch_size=self.args.eval_batch_size, collate_fn = val_data.collate_fn)
+    #     return val_dataloader
 
-    def train_dataloader(self):
-        train = dwie["train"]
-        train_data = DWIE_Data(train, self.tokenizer, self.args)
-        train_dataloader = DataLoader(train_data, batch_size=self.args.train_batch_size, collate_fn = train_data.collate_fn)
-        return train_dataloader
+    # def train_dataloader(self):
+    #     train = dwie["train"]
+    #     train_data = DWIE_Data(train, self.tokenizer, self.args)
+    #     train_dataloader = DataLoader(train_data, batch_size=self.args.train_batch_size, collate_fn = train_data.collate_fn)
+    #     return train_dataloader
 
     def _set_global_attention_mask(self, input_ids):
         """Configure the global attention pattern based on the task"""
@@ -89,6 +90,7 @@ class NERLongformer(pl.LightningModule):
         masked_input_ids = batch.pop("masked_input_ids", None)
         entity_span = batch.pop("entity_span", None)
         entity_mask = batch.pop("entity_mask", None)
+
         span_len_mask = batch.pop("span_len_mask", None)
         labels = batch.pop("labels", None)
 
@@ -120,12 +122,6 @@ class NERLongformer(pl.LightningModule):
         combined_embeds = torch.cat([span_len_embeddings, maxpooled_embeddings], dim=-1) #(bs, num_samples, 2*768)
         logits = self.classifier(combined_embeds).squeeze()        
 
-        ### MLM Objective
-        ##############################################################################################################
-        prediction_scores = self.lm_head(outputs[0])
-
-        ##############################################################################################################
-
         total_loss=0
         
         span_clf_loss = None
@@ -134,9 +130,15 @@ class NERLongformer(pl.LightningModule):
             span_clf_loss = loss_fct(logits.view(-1), labels.view(-1))
             total_loss+=span_clf_loss
 
-        mlm_loss_fct = nn.CrossEntropyLoss()
-        masked_lm_loss = mlm_loss_fct(prediction_scores.view(-1, self.config.vocab_size), batch["input_ids"].view(-1))
-        total_loss+=masked_lm_loss
+        ### MLM Objective
+        ##############################################################################################################
+        if self.args.mlm_task:
+            prediction_scores = self.lm_head(outputs[0])
+ 
+            mlm_loss_fct = nn.CrossEntropyLoss()
+            masked_lm_loss = mlm_loss_fct(prediction_scores.view(-1, self.config.vocab_size), batch["input_ids"].view(-1))
+            total_loss+=masked_lm_loss
+        ##############################################################################################################
 
         return (total_loss, logits, span_clf_loss, masked_lm_loss)
 

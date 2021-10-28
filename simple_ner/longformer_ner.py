@@ -12,9 +12,9 @@ args = argparse.Namespace(**config)
 task = Task.init(project_name='LongformerNER', task_name='simpleTokenClassification', tags=["muc4"], output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
-task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
-task.connect(args)
-task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+# task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+# task.connect(args)
+# task.execute_remotely(queue_name="128RAMv100", exit_process=True)
 
 ''' Writes to a jsonl file'''
 def to_jsonl(filename:str, file_obj):
@@ -163,6 +163,7 @@ class NERDataset(Dataset):
                 # self.processed_dataset["start"].append(token_span[0])
                 # self.processed_dataset["end"].append(token_span[1]+1)
 
+                # Factor in CLS
                 if token_span!=[0,0]:
                     labels[token_span[0]:token_span[0]+1] = [self.labels2idx["B-"+qns]]
                     if len(labels[token_span[0]+1:token_span[1]+1])>0 and (token_span[1]-token_span[0])>0:
@@ -236,6 +237,99 @@ def read_golds_from_test_file(data_dir, tokenizer):
             golds[docid] = extracts
     return doctexts_tokens, golds
 
+# def decode(label_ids, input_ids, offsets_mapping, id2label):
+#     result = []
+#     for k in range(len(label_ids)):
+#         words = []
+#         labels = []
+#         for i in range(len(label_ids[k])):
+#             start_ind, end_ind = offset_mapping[k][i]
+#             word = tokenizer.convert_ids_to_tokens([int(input_ids[k][i])])[0]
+#             is_subword = end_ind - start_ind != len(word)
+#             if is_subword:
+#                 if word.startswith('##'):
+#                     words[-1] += word[2:]
+#             else:
+#                 words.append(word)
+#                 labels.append(id2label[int(label_ids[k][i])])
+#         result.append(
+#             {'words': words,
+#              'labels': labels}
+#         )
+#     return result
+
+class Transformer_CRF(nn.Module):
+    def __init__(self, num_labels, start_label_id):
+        super().__init__()
+        self.num_labels = num_labels
+        self.start_label_id = start_label_id
+        self.transitions = nn.Parameter(torch.randn(self.num_labels, self.num_labels), requires_grad=True)
+        self.log_alpha = nn.Parameter(torch.zeros(1, 1, 1), requires_grad=False)
+        self.score = nn.Parameter(torch.zeros(1, 1), requires_grad=False)
+        self.log_delta = nn.Parameter(torch.zeros(1, 1, 1), requires_grad=False)
+        self.psi = nn.Parameter(torch.zeros(1, 1, 1), requires_grad=False)
+        self.path = nn.Parameter(torch.zeros(1, 1, dtype=torch.long), requires_grad=False)
+
+    @staticmethod
+    def log_sum_exp_batch(log_Tensor, axis=-1):
+        # shape (batch_size,n,m)
+        sum_score = torch.exp(log_Tensor - torch.max(log_Tensor, axis)[0].view(log_Tensor.shape[0], -1, 1)).sum(axis)
+        return torch.max(log_Tensor, axis)[0] + torch.log(sum_score)
+
+    def reset_layers(self):
+        self.log_alpha = self.log_alpha.fill_(0.)
+        self.score = self.score.fill_(0.)
+        self.log_delta = self.log_delta.fill_(0.)
+        self.psi = self.psi.fill_(0.)
+        self.path = self.path.fill_(0)
+
+    def forward(self, feats, label_ids):
+        forward_score = self._forward_alg(feats)
+        max_logLL_allz_allx, path, gold_score = self._crf_decode(feats, label_ids)
+        loss = torch.mean(forward_score - gold_score)
+        self.reset_layers()
+        return path, max_logLL_allz_allx, loss
+
+    def _forward_alg(self, feats):
+        """alpha-recursion or forward recursion; to compute the partition function"""
+        # feats -> (batch size, num_labels)
+        seq_size = feats.shape[1]
+        batch_size = feats.shape[0]
+        log_alpha = self.log_alpha.expand(batch_size, 1, self.num_labels).clone().fill_(-10000.)
+        log_alpha[:, 0, self.start_label_id] = 0
+        for t in range(1, seq_size):
+            log_alpha = (self.log_sum_exp_batch(self.transitions + log_alpha, axis=-1) + feats[:, t]).unsqueeze(1)
+        return self.log_sum_exp_batch(log_alpha)
+
+    def _crf_decode(self, feats, label_ids):
+        seq_size = feats.shape[1]
+        batch_size = feats.shape[0]
+
+        batch_transitions = self.transitions.expand(batch_size, self.num_labels, self.num_labels)
+        batch_transitions = batch_transitions.flatten(1)
+        score = self.score.expand(batch_size, 1)
+
+        log_delta = self.log_delta.expand(batch_size, 1, self.num_labels).clone().fill_(-10000.)
+        log_delta[:, 0, self.start_label_id] = 0
+        psi = self.psi.expand(batch_size, seq_size, self.num_labels).clone()
+
+        for t in range(1, seq_size):
+            batch_trans_score = batch_transitions.gather(
+                -1, (label_ids[:, t] * self.num_labels + label_ids[:, t-1]).view(-1, 1))
+            temp_score = feats[:, t].gather(-1, label_ids[:, t].view(-1, 1)).view(-1, 1)
+            score = score + batch_trans_score + temp_score
+
+            log_delta, psi[:, t] = torch.max(self.transitions + log_delta, -1)
+            log_delta = (log_delta + feats[:, t]).unsqueeze(1)
+
+        # trace back
+        path = self.path.expand(batch_size, seq_size).clone()
+        max_logLL_allz_allx, path[:, -1] = torch.max(log_delta.squeeze(), -1)
+        for t in range(seq_size-2, -1, -1):
+            path[:, t] = psi[:, t+1].gather(-1, path[:, t+1].view(-1, 1)).squeeze()
+
+        return max_logLL_allz_allx, path, score
+
 class NERLongformer(pl.LightningModule):
     """Pytorch Lightning module. It wraps up the model, data loading and training code"""
     def __init__(self, params):
@@ -249,21 +343,26 @@ class NERLongformer(pl.LightningModule):
         self.labels2idx["O"] = 0
 
         # Load and update config then load a pretrained LEDForConditionalGeneration
-        self.config = AutoConfig.from_pretrained("allenai/longformer-base-4096")
+        self.config = AutoConfig.from_pretrained(self.args.model)
         self.config.gradient_checkpointing = True
         self.config.num_labels = len(self.labels2idx.keys())
-        self.model = AutoModelForTokenClassification.from_pretrained("allenai/longformer-base-4096", config=self.config)
-        # Load tokenizer and metric
-        self.tokenizer = AutoTokenizer.from_pretrained("allenai/longformer-base-4096", use_fast=True)
+        self.model = AutoModelForTokenClassification.from_pretrained(self.args.model, config=self.config)
+
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(self.args.model, use_fast=True)
         self.tokenizer.model_max_length = 1024
         self.softmax = nn.Softmax(dim=-1)
+        self.crf_layer = Transformer_CRF(num_labels=self.config.num_labels, start_label_id=self.tokenizer.cls_token_id)
 
+        # Get loss weights
         dataset_split = self.dataset["train"]
         dataset = NERDataset(dataset=dataset_split, tokenizer=self.tokenizer, labels2idx=self.labels2idx, args=self.args)
         y_train = torch.stack(dataset.processed_dataset["labels"]).view(-1).cpu().numpy()
         self.loss_weights=torch.cuda.FloatTensor(compute_class_weight("balanced", np.unique(y_train), y_train))
 
+        # list of doc ids
         self.test_doc_ids = [doc["docid"] for doc in self.dataset["test"]]
+
 
         if self.args.use_entity_embeddings:
 
@@ -318,19 +417,20 @@ class NERLongformer(pl.LightningModule):
 
         outputs = self.model(**batch) #, global_attention_mask=self._set_global_attention_mask(batch["input_ids"]))
         logits = outputs.logits
-        
-        loss=None
-        
+
+        loss=None       
         if "labels" in batch.keys():
-            loss_fct = nn.CrossEntropyLoss(self.loss_weights, ignore_index=-100)
-            # Only keep active parts of the loss
-            if batch["attention_mask"] is not None:
-                active_loss = batch["attention_mask"].view(-1) == 1
-                active_logits = logits.view(-1, self.config.num_labels)[active_loss]
-                active_labels = batch["labels"].view(-1)[active_loss]
-                loss = loss_fct(active_logits, active_labels)
+            if self.args.use_crf:
+                #torch.nn.functional.one_hot(batch["labels"])
+                logits, active_logits, loss = self.crf_layer(logits, batch["labels"])
             else:
-                loss = loss_fct(logits.view(-1, self.num_labels), batch["labels"].view(-1))
+                loss_fct = nn.CrossEntropyLoss(self.loss_weights, ignore_index=-100)
+                # Only keep active parts of the loss
+                if batch["attention_mask"] is not None:
+                    active_loss = batch["attention_mask"].view(-1) == 1
+                    active_logits = logits.view(-1, self.config.num_labels)[active_loss]
+                    active_labels = batch["labels"].view(-1)[active_loss]
+                    loss = loss_fct(active_logits, active_labels)
 
         return (loss, logits)
 
@@ -365,20 +465,27 @@ class NERLongformer(pl.LightningModule):
 
     def validation_step(self, batch, batch_nb):
         outputs = self._evaluation_step('val', batch, batch_nb)
-        preds = torch.argmax(outputs["logits"], dim=-1)
+        if self.args.use_crf:
+            preds = outputs["logits"]
+        else:    
+            preds = torch.argmax(outputs["logits"], dim=-1)
         labels = batch["labels"]
         return {'val_loss': outputs["loss"], "preds": preds, "labels": labels}
 
     def validation_epoch_end(self, outputs):
-        val_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
+        val_loss = torch.stack([x["val_loss"] for x in outputs]).mean()       
+
         val_logits = torch.stack([x["preds"] for x in outputs], dim=0).view(-1, self.tokenizer.model_max_length)
         val_labels = torch.stack([x["labels"] for x in outputs]).view(-1, self.tokenizer.model_max_length)
-        #print(classification_report(val_logits.view(-1).cpu().detach(), val_labels.view(-1).cpu().detach()))
+        print(classification_report(val_labels.view(-1).cpu().detach(), val_logits.view(-1).cpu().detach()))
         self.log("val_loss", val_loss)
 
     def test_step(self, batch, batch_nb):
         outputs = self._evaluation_step('val', batch, batch_nb)
-        preds = torch.argmax(self.softmax(outputs["logits"]), dim=-1)
+        if self.args.use_crf:
+            preds = outputs["logits"]
+        else:    
+            preds = torch.argmax(self.softmax(outputs["logits"]), dim=-1)
         labels = batch["labels"]
         return {'test_loss': outputs["loss"], "preds": preds, "labels": labels, "tokens": batch["input_ids"]}
 
@@ -393,7 +500,7 @@ class NERLongformer(pl.LightningModule):
 
         tokens = torch.stack([x["tokens"] for x in outputs]).view(-1, self.tokenizer.model_max_length).cpu().detach().tolist()
         tokens = [self.tokenizer.convert_ids_to_tokens(token) for token in tokens]
-        print(classification_report(test_preds.view(-1).cpu().detach(), test_labels.view(-1).cpu().detach(), target_names=[key for key in self.labels2idx.keys()]))       
+        print(classification_report(test_labels.view(-1).cpu().detach(), test_preds.view(-1).cpu().detach(), target_names=[key for key in self.labels2idx.keys()]))       
 
         self.idx2labels = {key: value for value, key in self.labels2idx.items()}
         predictions = [[(idx, self.idx2labels[tag]) for idx, tag in enumerate(doc)] for doc in test_preds.cpu().detach().tolist()]        
@@ -433,7 +540,7 @@ class NERLongformer(pl.LightningModule):
         for idx, (span_list, doc) in enumerate(zip(doc_span_list, tokens)):
             for span in span_list:
                 #muc4_pred_format[idx][span[-1]].append(' '.join(remove_led_prefix_from_tokens(doc[span[0]:span[1]+1])))
-                muc4_pred_format[idx][span[-1]].append(self.tokenizer.convert_tokens_to_string(doc[span[0]:span[1]+1]))
+                muc4_pred_format[idx][span[-1]].append(self.tokenizer.convert_tokens_to_string(doc[span[0]+1:span[1]+2]))
 
         preds = OrderedDict()
         for key, doc in zip(self.test_doc_ids, muc4_pred_format):
@@ -464,7 +571,8 @@ class NERLongformer(pl.LightningModule):
         clearlogger.report_scalar(title='precision', series = 'test', value=logs["test_micro_avg_precision_phi_strict"], iteration=1) 
         clearlogger.report_scalar(title='recall', series = 'test', value=logs["test_micro_avg_recall_phi_strict"], iteration=1) 
 
-        to_jsonl("./predictions.jsonl", preds)
+        preds_list = [{key: value} for key, value in preds.items()]
+        to_jsonl("./predictions.jsonl", preds_list)
         task.upload_artifact(name='predictions', artifact_object="./predictions.jsonl")
 
 
@@ -506,13 +614,13 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
     period=5
 )
 
-# trained_model_path = bucket_ops.get_file(
-#             remote_path="s3://experiment-logging/storage/LongformerNER/simpleTokenClassification.edbb72eee67242278f0ff658fd16f61e/models/best_ner_model.ckpt"
-#             )
-#model = NERLongformer.load_from_checkpoint(trained_model_path, params = args)
+trained_model_path = bucket_ops.get_file(
+            remote_path="s3://experiment-logging/storage/LongformerNER/simpleTokenClassification.9ec8ef5737544705bfb757ef25e04f02/models/best_ner_model.ckpt"
+            )
+model = NERLongformer.load_from_checkpoint(trained_model_path, params = args)
 
-model = NERLongformer(args)
+#model = NERLongformer(args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback])
-trainer.fit(model)
+#trainer.fit(model)
 results = trainer.test(model)
 
