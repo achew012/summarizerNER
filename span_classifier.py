@@ -1,38 +1,64 @@
 from clearml import Task, StorageManager, Dataset as ds
 import argparse, json, os, random, math, ipdb
-
+ 
 # Task.add_requirements('transformers', package_version='4.2.0')
-task = Task.init(project_name='ner-pretraining', task_name='EntitySpanPretraining', tags=["maxpool", "mlm_mask"], output_uri="s3://experiment-logging/storage/")
+task = Task.init(project_name='SpanClassifier', task_name='EntitySpanClassifier', tags=["maxpool"], output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
-
+ 
 # config = json.load(open('config.json'))
-
+ 
 config={
-    "lr": 1e-4,
-    "num_epochs":15,
+    "lr": 5e-5,
+    "num_epochs":1,
     "train_batch_size":4,
-    "eval_batch_size":1,
-    "max_length": 2048, # be mindful underlength will cause device cuda side error
-    "max_span_len": 15,
-    "max_spans": 25,
+    "eval_batch_size":2,
+    "max_length": 1024, # be mindful underlength will cause device cuda side error
+    "max_span_len": 8,
+    "max_num_spans":1024*3,
     "mlm_task": False,
-    "bio_task": True,
+    "bio_task": False,
 }
+
 args = argparse.Namespace(**config)
-task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
-task.execute_remotely(queue_name="128RAMv100", exit_process=True)
-task.connect(args)
+# task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+# task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+# task.connect(args)
 
-dataset = ds.get(dataset_name="processed-DWIE", dataset_project="datasets/DWIE", dataset_tags=["1st-mention"], only_published=True)
+# dataset = ds.get(dataset_name="processed-DWIE", dataset_project="datasets/DWIE", dataset_tags=["1st-mention"], only_published=True)
+# dataset_folder = dataset.get_local_copy()
+# dwie = json.load(open(os.path.join(dataset_folder, "data", "new_dwie.json")))["dataset"]
+ 
+dataset = ds.get(dataset_name="muc4-processed", dataset_project="datasets/muc4", dataset_tags=["processed", "GRIT"], only_published=True)
 dataset_folder = dataset.get_local_copy()
-dwie = json.load(open(os.path.join(dataset_folder, "data", "new_dwie.json")))["dataset"]
+print(list(os.walk(os.path.join(dataset_folder, "data/muc4-grit/processed"))))
 
+''' Writes to a jsonl file'''
+def to_jsonl(filename:str, file_obj):
+    resultfile = open(filename, 'wb')
+    writer = jsonlines.Writer(resultfile)
+    writer.write_all(file_obj)
+
+def read_json(jsonfile):
+    with open(jsonfile, 'rb') as file:
+        file_object = [json.loads(sample) for sample in file]
+    return file_object
+
+train_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/train.json"))
+dev_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/dev.json"))
+test_data = read_json(os.path.join(dataset_folder, "data/muc4-grit/processed/test.json"))
+
+muc4 = {
+    "train": train_data,
+    "val": dev_data,
+    "test": test_data
+}
+ 
 import os, random
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import LongformerForMaskedLM, LongformerModel, LongformerTokenizer, LongformerConfig
+from transformers import LongformerForMaskedLM, LongformerModel, LongformerTokenizer, LongformerConfig, AutoTokenizer
 from transformers.models.longformer.modeling_longformer import LongformerLMHead, _compute_global_attention_mask
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
@@ -40,8 +66,10 @@ from sklearn.utils.class_weight import compute_class_weight
 import numpy as np
 from sklearn.metrics import classification_report, precision_recall_fscore_support
 
-from typing import Callable, List, Set, Tuple, TypeVar, Optional
+from allennlp.nn.util import batched_index_select
 
+from typing import Callable, List, Set, Tuple, TypeVar, Optional
+ 
 def enumerate_spans(
     sentence: List,
     offset: int = 0,
@@ -89,157 +117,195 @@ def enumerate_spans(
                 spans.append((start, end))
     return spans
 
-class DWIE_Data(Dataset):
+def get_entity_token_id(context_encodings, role_ans:list):
+    overflow_count = 0
+    entity_spans=[]            
+    for role, ans_char_start, ans_char_end, mention in role_ans:
+        sequence_ids = context_encodings.sequence_ids()
+
+        # Detect if the answer is out of the span (in which case this feature is labeled with the CLS index).
+        qns_offset = sequence_ids.index(0)+1
+        pad_start_idx = sequence_ids[sequence_ids.index(0):].index(None)
+        offsets_wo_pad = context_encodings["offset_mapping"][0][qns_offset:pad_start_idx]
+
+        # if char indices more than end idx in last word span
+        if ans_char_end>offsets_wo_pad[-1][1] or ans_char_start>offsets_wo_pad[-1][1]:
+            overflow_count+=1
+            ans_char_start = 0
+            ans_char_end = 0
+
+        if ans_char_start==0 and ans_char_end==0:
+            token_span=[0,0]
+        else:
+            token_span=[]
+            for idx, span in enumerate(offsets_wo_pad):
+                if ans_char_start>=span[0] and ans_char_start<=span[1] and len(token_span)==0:
+                    token_span.append(idx) 
+
+                if ans_char_end>=span[0] and ans_char_end<=span[1] and len(token_span)==1:
+                    token_span.append(idx)
+                    break                        
+                        
+        # If token span is incomplete
+        if len(token_span)<2:
+            token_span=[0,0]
+            # ipdb.set_trace()
+
+        entity_spans.append(token_span)
+
+    return entity_spans
+
+class NERDataset(Dataset):
     def __init__(self, dataset, tokenizer, args):
         self.args = args
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.consolidated_dataset = []
-        self.max_spans = args.max_spans # 15 -> 95 , 25 -> 88, 20 -> 92 docs
+        self.max_num_spans = args.max_num_spans
+        self.args = args
+
+        self.processed_dataset = {
+            "docid": [],
+            "context": [],
+            "input_ids": [],
+            "attention_mask": [],
+            "gold_mentions": [],
+            "labels":[],
+            "span_len_mask":[],
+            "spans": []
+        }
         self.max_span_len = args.max_span_len
-
-        for idx, doc in enumerate(self.dataset):
-            context = ' '.join(doc["sentences"])
-            tokens = self.tokenizer.tokenize(context)
-            context_len = len(tokens)
-            spans = enumerate_spans(tokens, min_span_width=1, max_span_width=self.max_span_len)
-
-            self.encodings = self.tokenizer(context, padding="max_length", truncation=True, max_length=self.tokenizer.model_max_length, return_tensors="pt")
-            masked_input_ids = self.encodings["input_ids"][0].clone()
+        self.max_num_spans = args.max_num_spans
+        
+        labels=[]
+    
+        for doc in dataset:
+            docid = doc["docid"]
+            context = doc["doctext"] #self.tokenizer.decode(self.tokenizer.encode(doc["doctext"]))
             
-            if len(doc["entities"])>0:
-                doc_entity_mask = torch.zeros(self.tokenizer.model_max_length)
-                # bio_labels = torch.full_like(self.encodings["input_ids"], -100)[0]
-                # bio_labels[:context_len] = self.class2id["O"]
+            tokens = self.tokenizer.tokenize(context)[:self.tokenizer.model_max_length]
+            context_len = len(tokens)
+
+            spans = enumerate_spans(tokens, min_span_width=1, max_span_width=self.max_span_len)[:self.max_num_spans]
+            spans = [(span[0], span[1], span[1]-span[0]) for span in spans]
+            spans[len(spans):self.max_num_spans] = [(0,0,0)]*(self.max_num_spans-len(spans))
                 
-                #entities_samples = random.choices(doc["entities"], k=self.max_spans)
-                #entities_samples = random.sample(doc["entities"], k=self.max_spans)
-                entity_spans = []
-                entity_len_mask = []
-                for idx, entity in enumerate(doc["entities"]):
-                    entity_start = entity["start"] if entity["start"] < self.tokenizer.model_max_length else 0
-                    entity_end = entity["end"] if entity["end"]<self.tokenizer.model_max_length else self.tokenizer.model_max_length-1
+            ### Only take the 1st label of each role
+            role_ans = [[key, doc["extracts"][key][0][0][1] if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][1]+len(doc["extracts"][key][0][0][0]) if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else ""] for key in doc["extracts"].keys()]
 
-                    ent_masky = torch.zeros(self.max_span_len)
+            context_encodings = self.tokenizer(context, padding="max_length", truncation=True, max_length=self.tokenizer.model_max_length, return_offsets_mapping=True, return_tensors="pt")
+    
+            ### expand on all labels in each role
+            # role_ans = [[key, mention[1] if len(mention)>0 else 0, mention[1]+len(mention[0]) if len(mention)>0 else 0, mention[0] if len(mention)>0 else ""] for key in doc["extracts"].keys() for cluster in doc["extracts"][key] for mention in cluster]    
 
-                    pair = (entity_start-1 if entity_start>0 else 0, entity_end)
-                    if pair in spans:
-                        # prob = random.randint(1,10)
-                        # if prob<=8:
-                        #     masked_input_ids[pair[0]+1:pair[1]+1] = self.tokenizer.mask_token_id
-                        # if prob<=9:
-                        #     masked_input_ids[pair[0]+1:pair[1]+1] = random.randint(10, self.tokenizer.vocab_size-10) 
-                        # else:
-                        #     pass                                   
-                        masked_input_ids[pair[0]+1:pair[1]+1] = self.tokenizer.mask_token_id
+            entity_spans = get_entity_token_id(context_encodings, role_ans)
+            entity_spans = [span for span in entity_spans]
+            labels = [1.0 if (list(span) in entity_spans and list(span)!=[0,0]) else 0.0 for span in spans]
 
-                        # get mask of entities
-                        doc_entity_mask[pair[0]:pair[1]] = idx+1
-                        ent_masky[:(pair[1]-pair[0])] = torch.arange(pair[0], pair[1])
-                        entity_span = spans.pop(spans.index(pair))
-                        # entity_span = (entity_span[0]+1,entity_span[1]+1) #offset the CLS
-                        entity_spans.append(torch.tensor(entity_span))
-                        entity_len_mask.append(ent_masky)
+            # entity_len_mask=[]
+            # noise_len_mask=[]
+            # for span in spans:
+            #     span_mask = torch.zeros(self.max_span_len)
+            #     span_mask[:(span[1]-span[0])] = torch.arange(span[0], span[1])
+                    
+            #     if list(span) in entity_spans:
+            #         # labels.append(1.0)
+            #         entity_len_mask.append(span_mask)
+            #     else:
+            #         # labels.append(0.0)
+            #         noise_len_mask.append(span_mask)
+            
+            # try:
+            #     num_noise_samples = 20 - (10 if len(entity_len_mask)>10 else len(entity_len_mask))
+            #     sample_noise_len_mask = random.sample(noise_len_mask, num_noise_samples)
+            # except:
+            #     ipdb.set_trace()
 
-                #entities_samples = random.choices(entity_spans, k=self.max_spans)
-                selected_entities = [random.randint(0, len(entity_spans)-1) for i in range(self.max_spans)]
-                entities_samples = [entity_spans[i] for i in selected_entities]
-                entity_len_mask = [entity_len_mask[i] for i in selected_entities]
-                negative_samples = [torch.tensor(sample) for sample in random.sample(spans, k=self.max_spans)]
+            # span_len_mask = entity_len_mask + sample_noise_len_mask
+            
+            # labels = [1.0]*len(entity_len_mask) + [0.0]*len(sample_noise_len_mask)
 
-                noise_len_mask = []
-                for negative_sample in negative_samples:
-                    entity_start = negative_sample[0]
-                    entity_end = negative_sample[1]
+            self.processed_dataset["input_ids"].append(context_encodings["input_ids"]),
+            self.processed_dataset["attention_mask"].append(context_encodings["attention_mask"]),
+            self.processed_dataset["spans"].append(torch.tensor(spans))
+            self.processed_dataset["labels"].append(torch.tensor(labels))
+            # self.processed_dataset["span_len_mask"].append(torch.stack(span_len_mask))
 
-                    noise_masky = torch.zeros(self.max_span_len)
-                    noise_masky[:(entity_end-entity_start)] = torch.arange(entity_start, entity_end)                        
-
-                    doc_entity_mask[entity_start:entity_end] = -200
-                    noise_len_mask.append(noise_masky)
-
-                labels = torch.tensor([1.0]*len(entities_samples)+[0.0]*len(negative_samples))
-                samples = entities_samples + negative_samples
-                samples_mask = entity_len_mask + noise_len_mask
-
-                self.consolidated_dataset.append({
-                    "masked_input_ids": masked_input_ids,
-                    "input_ids": self.encodings["input_ids"],
-                    "attention_mask": self.encodings["attention_mask"],
-                    "entity_span": torch.stack(samples),
-                    "entity_mask": doc_entity_mask,
-                    "span_len_mask": torch.stack(samples_mask),
-                    "labels": labels
-                })           
-
+ 
     def __len__(self):
-        return len(self.consolidated_dataset)
-
+        return len(self.processed_dataset["input_ids"])
+ 
     def __getitem__(self, idx):
-        item = self.consolidated_dataset[idx]
+        item={}
+        item['input_ids'] = self.processed_dataset["input_ids"][idx]
+        item['attention_mask'] = self.processed_dataset["attention_mask"][idx]
+        # item['span_len_mask'] = self.processed_dataset["span_len_mask"][idx]
+        item['spans'] = self.processed_dataset["spans"][idx]
+        item['labels'] = self.processed_dataset["labels"][idx]
         return item
-
+ 
     def collate_fn(self, batch):
-        masked_input_ids = torch.stack([ex['masked_input_ids'] for ex in batch]).squeeze(1)
         input_ids = torch.stack([ex['input_ids'] for ex in batch]).squeeze(1) 
         attention_mask = torch.stack([ex['attention_mask'] for ex in batch]).squeeze(1)
-        entity_span = torch.stack([ex['entity_span'] for ex in batch])
-        entity_mask = torch.stack([ex['entity_mask'] for ex in batch])
+        spans = torch.stack([ex['spans'] for ex in batch])
         labels = torch.stack([ex['labels'] for ex in batch])
-        span_len_mask = torch.stack([ex["span_len_mask"] for ex in batch])
-        
+        # span_len_mask = torch.stack([ex["span_len_mask"] for ex in batch])
+         
         return {
-                "masked_input_ids": masked_input_ids,
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "entity_span": entity_span,
-                "entity_mask": entity_mask,
-                "labels": labels,
-                "span_len_mask": span_len_mask
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "spans": spans,
+            "labels": labels,
+              # "span_len_mask": span_len_mask
         }
-
+ 
 class NERLongformer(pl.LightningModule):
     def __init__(self, args):
         super().__init__()
-        self.args = args
+        self.args=args
         self.config = LongformerConfig.from_pretrained('allenai/longformer-base-4096')
         self.config.gradient_checkpointing = True
 
-        self.tokenizer = LongformerTokenizer.from_pretrained('allenai/longformer-base-4096')
+        self.tokenizer = AutoTokenizer.from_pretrained('allenai/longformer-base-4096', use_fast=True)
         self.tokenizer.model_max_length = self.args.max_length
 
         self.longformer = LongformerModel.from_pretrained('allenai/longformer-base-4096', config=self.config)
-
         #self.longformerMLM = LongformerForMaskedLM.from_pretrained('allenai/longformer-base-4096', output_hidden_states=True)
 
         self.lm_head = LongformerLMHead(self.config) 
-
+        # self.lm_head = LongformerLMHead(self.config) 
+ 
         # train_data = DWIE_Data(dwie["train"], self.tokenizer, self.class2id, self.args)
         # y_train = torch.stack([doc["bio_labels"] for doc in train_data.consolidated_dataset]).view(-1).cpu().numpy()
-        # y_train = y_train[y_train != -100]
-        # self.class_weights=torch.cuda.FloatTensor(compute_class_weight("balanced", np.unique(y_train), y_train))
         # #self.class_weights[0] = self.class_weights[0]/2
         # self.class_weights = torch.cuda.FloatTensor([0.20, 1, 1.2, 1, 1.2])
         # print("weights: {}".format(self.class_weights))
-
-        self.sigmoid = nn.Sigmoid()
+        self.dropout = nn.Dropout(0.1)
+ 
         self.classifier = nn.Sequential(
-            nn.Linear(self.config.hidden_size*2, self.config.hidden_size),
+            nn.Linear(self.config.hidden_size*2+150, self.config.hidden_size),
             nn.ReLU(),
             nn.Linear(self.config.hidden_size, 1),
             nn.Sigmoid(),
-        )
-        self.size_embeddings = nn.Embedding(self.args.max_span_len, self.config.hidden_size)
-        
+         )
+        # self.size_embeddings = nn.Embedding(self.args.max_span_len, self.config.hidden_size)
+        self.width_embedding = nn.Embedding(self.args.max_span_len+1, 150)
+
+    def test_dataloader(self):
+        test = muc4["test"]
+        test_data = NERDataset(test, self.tokenizer, self.args)
+        test_dataloader = DataLoader(test_data, batch_size=self.args.eval_batch_size, collate_fn = test_data.collate_fn)
+        return test_dataloader
+
     def val_dataloader(self):
-        val = dwie["test"]
-        val_data = DWIE_Data(val, self.tokenizer, self.args)
+        val = muc4["val"]
+        val_data = NERDataset(val, self.tokenizer, self.args)
         val_dataloader = DataLoader(val_data, batch_size=self.args.eval_batch_size, collate_fn = val_data.collate_fn)
         return val_dataloader
-
+ 
     def train_dataloader(self):
-        train = dwie["train"]
-        train_data = DWIE_Data(train, self.tokenizer, self.args)
+        train = muc4["train"]
+        train_data = NERDataset(train, self.tokenizer, self.args)
         train_dataloader = DataLoader(train_data, batch_size=self.args.train_batch_size, collate_fn = train_data.collate_fn)
         return train_dataloader
 
@@ -268,102 +334,138 @@ class NERLongformer(pl.LightningModule):
 
         return global_attention_mask
 
+    def _get_span_embeddings(self, input_ids, spans, token_type_ids=None, attention_mask=None):
+        outputs = self.longformer(input_ids=input_ids, attention_mask=attention_mask)       
+        sequence_output = outputs[0]
+        sequence_output = self.dropout(sequence_output)
 
+        """
+        spans: [batch_size, num_spans, 3]; 0: left_ned, 1: right_end, 2: width
+        spans_mask: (batch_size, num_spans, )
+        """
+        spans_start = spans[:, :, 0].view(spans.size(0), -1)
+        spans_start_embedding = batched_index_select(sequence_output, spans_start)
+        spans_end = spans[:, :, 1].view(spans.size(0), -1)
+        spans_end_embedding = batched_index_select(sequence_output, spans_end)
+
+        spans_width = spans[:, :, 2].view(spans.size(0), -1)
+        spans_width_embedding = self.width_embedding(spans_width)
+
+        # Concatenate embeddings of left/right points and the width embedding
+        spans_embedding = torch.cat((spans_start_embedding, spans_end_embedding, spans_width_embedding), dim=-1)
+        """
+        spans_embedding: (batch_size, num_spans, hidden_size*2+embedding_dim)
+        """
+        return spans_embedding
+ 
     def forward(self, **batch):
-        # in lightning, forward defines the prediction/inference actions
-        masked_input_ids = batch.pop("masked_input_ids", None)
-        entity_span = batch.pop("entity_span", None)
-        entity_mask = batch.pop("entity_mask", None)
-        span_len_mask = batch.pop("span_len_mask", None)
+      # in lightning, forward defines the prediction/inference actions             
+      #span_len_mask = batch.pop("span_len_mask", None)
+        spans = batch.pop("spans", None)
         labels = batch.pop("labels", None)
         total_loss=0
+ 
+        span_embeds = self._get_span_embeddings(batch["input_ids"], spans, token_type_ids=None, attention_mask=batch["attention_mask"])
 
-        outputs = self.longformer(
-            **batch, 
-            global_attention_mask=self._set_global_attention_mask(batch["input_ids"]), output_hidden_states=True
-            )
-
-        sequence_output = outputs[0][:, 1:] 
+        # outputs = self.longformer(
+        #     **batch, 
+        #     global_attention_mask=self._set_global_attention_mask(batch["input_ids"]), output_hidden_states=True
+        #     )
+ 
+        # sequence_output = outputs[0][:, 1:] 
+        # span_index = spans.view(spans.size(0), -1).unsqueeze(-1).expand(spans.size(0), spans.size(1)*spans.size(2), sequence_output.size(-1))
+        # span_embeddings = torch.gather(sequence_output, 1, span_index)
+        # span_embedding_pairs = torch.stack(torch.split(span_embeddings, 2, 1)).squeeze().transpose(0, 1)
+        # combined_embeds = span_embedding_pairs.view(span_embedding_pairs.size()[0],span_embedding_pairs.size()[1], -1)
+        if labels!=None:
+            pass
 
         ### Span CLF Objective
         ############################################################################################################
-        span_index = span_len_mask.view(span_len_mask.size(0), -1).unsqueeze(-1).expand(span_len_mask.size(0), span_len_mask.size(1)*span_len_mask.size(2), sequence_output.size(-1)) # (bs, num_samples*max_span_len, 768)
-        span_len_binary_mask = span_len_mask.gt(0).long().unsqueeze(-1)
-        span_len_binary_index = span_len_binary_mask.sum(-2).squeeze(-1)
-        span_len_embeddings = self.size_embeddings(span_len_binary_index)
+        # span_index = span_len_mask.view(span_len_mask.size(0), -1).unsqueeze(-1).expand(span_len_mask.size(0), span_len_mask.size(1)*span_len_mask.size(2), sequence_output.size(-1)) # (bs, num_samples*max_span_len, 768)
+        # span_len_binary_mask = span_len_mask.gt(0).long().unsqueeze(-1)
+        # span_len_binary_index = span_len_binary_mask.sum(-2).squeeze(-1)
+        # span_len_embeddings = self.size_embeddings(span_len_binary_index)
 
-        span_len_binary_mask_embeddings = span_len_binary_mask.expand(span_len_binary_mask.size(0), span_len_binary_mask.size(1), span_len_binary_mask.size(2), sequence_output.size(-1))
-        span_embeddings = torch.gather(sequence_output, 1, span_index.long()) # (bs, num_samples*max_span_len, 768)
-        span_embedding_groups = torch.stack(torch.split(span_embeddings, 15, 1)).transpose(0,1) # (bs, num_samples, max_span_len, 768)
-        extracted_spans_after_binary_mask = span_len_binary_mask_embeddings*span_embedding_groups #makes all padding positions into zero vectors (bs, num_samples, max_span_len, 768) 
-        maxpooled_embeddings = torch.max(extracted_spans_after_binary_mask, dim=-2).values # (bs, num_samples, 768)
-
-        # if len(cls_output.repeat(sequence_output.size()[0], span_len_mask.size()[1], 1).size())!=len(maxpooled_embeddings.size()):
-        #     ipdb.set_trace()
-
-        #combined_embeds = torch.cat([cls_output.unsqueeze(1).repeat(1, 40, 1), maxpooled_embeddings], dim=-1) #(bs, num_samples, 2*768)
-        combined_embeds = torch.cat([span_len_embeddings, maxpooled_embeddings], dim=-1) #(bs, num_samples, 2*768)
-        logits = self.classifier(combined_embeds).squeeze()        
-
+        # span_len_binary_mask_embeddings = span_len_binary_mask.expand(span_len_binary_mask.size(0), span_len_binary_mask.size(1), span_len_binary_mask.size(2), sequence_output.size(-1))
+        # span_embeddings = torch.gather(sequence_output, 1, span_index.long()) # (bs, num_samples*max_span_len, 768)
+        # span_embedding_groups = torch.stack(torch.split(span_embeddings, 15, 1)).transpose(0,1) # (bs, num_samples, max_span_len, 768)
+        # extracted_spans_after_binary_mask = span_len_binary_mask_embeddings*span_embedding_groups #makes all padding positions into zero vectors (bs, num_samples, max_span_len, 768) 
+        # maxpooled_embeddings = torch.max(extracted_spans_after_binary_mask, dim=-2).values # (bs, num_samples, 768)
+ 
+        # #combined_embeds = torch.cat([cls_output.unsqueeze(1).repeat(1, 40, 1), maxpooled_embeddings], dim=-1) #(bs, num_samples, 2*768)
+        # combined_embeds = torch.cat([span_len_embeddings, maxpooled_embeddings], dim=-1) #(bs, num_samples, 2*768)
+ 
+        logits = self.classifier(span_embeds).squeeze()        
+ 
         masked_lm_loss = None        
         span_clf_loss = None
         if labels!=None:
             loss_fct = nn.BCELoss()
             span_clf_loss = loss_fct(logits.view(-1), labels.view(-1))
             total_loss+=span_clf_loss
-
-        ### MLM Objective
-        ##############################################################################################################
-        if self.args.mlm_task:
-            prediction_scores = self.lm_head(outputs[0])
  
-            mlm_loss_fct = nn.CrossEntropyLoss()
-            masked_lm_loss = mlm_loss_fct(prediction_scores.view(-1, self.config.vocab_size), batch["input_ids"].view(-1))
-            total_loss+=masked_lm_loss
-        ##############################################################################################################
-
-        return (total_loss, logits, span_clf_loss, masked_lm_loss)
-
+        return (total_loss, logits)
+ 
     def training_step(self, batch, batch_idx):
         # training_step defines the train loop. It is independent of forward
-        loss, _, span_clf_loss, masked_lm_loss = self(**batch)
+        loss, _ = self(**batch)
         # logits = torch.argmax(self.softmax(logits), dim=-1)
         return {"loss": loss}
-
-    def training_epoch_end(self, outputs):
-        train_loss_mean = torch.stack([x["loss"] for x in outputs]).mean()
-
+ 
+    def validation_step(self, batch, batch_idx):
+        # training_step defines the train loop. It is independent of forward
+        #input_ids, attention_mask, labels = batch
+        loss, logits = self(**batch)
+        clearlogger.report_text(logits)
+        preds = (logits>0.5).long()
+        return {"val_loss": loss, "preds": preds, "labels": batch["labels"]}
+ 
+    def validation_epoch_end(self, outputs):
+        val_loss_mean = torch.stack([x["val_loss"] for x in outputs]).mean()
+        val_preds = torch.stack([x["preds"] for x in outputs], dim=-1).view(-1).cpu().detach().tolist()
+        val_labels = torch.stack([x["labels"] for x in outputs], dim=-1).view(-1).cpu().detach().tolist()
+ 
         logs = {
-            "train_loss": train_loss_mean,
+            "val_loss": val_loss_mean,
         }
 
-        self.log("train_loss", logs["train_loss"])
+        precision, recall, f1, support = precision_recall_fscore_support(val_labels, val_preds, average='macro')
 
-    def validation_step(self, batch, batch_idx):
+        self.log("val_loss", logs["val_loss"])
+        self.log("val_recall", recall)
+        self.log("val_f1", f1)
+ 
+    def test_step(self, batch, batch_idx):
         # training_step defines the train loop. It is independent of forward
         #input_ids, attention_mask, labels = batch
         loss, logits, span_clf_loss, masked_lm_loss = self(**batch)
         clearlogger.report_text(logits)
         #clearlogger.report_scalar(title='mlm_loss', series = 'val', value=masked_lm_loss, iteration=batch_idx) 
         preds = (logits>0.5).long()
-        return {"val_loss": loss, "preds": preds, "labels": batch["labels"]}
+        return {"test_loss": loss, "preds": preds, "labels": batch["labels"], "spans": batch["spans"]}
 
-    def validation_epoch_end(self, outputs):
-        val_loss_mean = torch.stack([x["val_loss"] for x in outputs]).mean()
-        val_preds = torch.stack([x["preds"] for x in outputs]).view(-1).cpu().detach().tolist()
-        val_labels = torch.stack([x["labels"] for x in outputs]).view(-1).cpu().detach().tolist()
+    def test_epoch_end(self, outputs):
+        test_loss_mean = torch.stack([x["test_loss"] for x in outputs]).mean()
 
+        ipdb.set_trace()
+
+        test_spans = torch.stack([x["spans"] for x in outputs]).view(-1).cpu().detach().tolist()
+
+        test_preds = torch.stack([x["preds"] for x in outputs]).view(-1).cpu().detach().tolist()
+        test_labels = torch.stack([x["labels"] for x in outputs]).view(-1).cpu().detach().tolist()
         logs = {
-            "val_loss": val_loss_mean,
+            "test_loss": test_loss_mean,
         }
-        precision, recall, f1, support = precision_recall_fscore_support(val_labels, val_preds, average='macro')
+        precision, recall, f1, support = precision_recall_fscore_support(test_labels, test_preds, average='macro')
 
-        self.log("val_loss", logs["val_loss"])
-        self.log("val_precision", precision)
-        self.log("val_recall", recall)
-        self.log("val_f1", f1)
+        self.log("test_loss", logs["test_loss"])
+        self.log("test_precision", precision)
+        self.log("test_recall", recall)
+        self.log("test_f1", f1)
 
-    # Freeze weights?
+
+     # Freeze weights?
     def configure_optimizers(self):
         # Freeze alternate layers of longformer
         for idx, (name, parameters) in enumerate(self.longformer.named_parameters()):

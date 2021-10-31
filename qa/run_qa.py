@@ -198,8 +198,6 @@ class NERDataset(Dataset):
                 self.processed_dataset["end"].append(token_span[1]+qns_offset+1)
 
             # self.processed_dataset["labels"].append(torch.tensor(labels))
-
-
             # ipdb.set_trace()
 
         print("OVERFLOW COUNT: ", overflow_count)
