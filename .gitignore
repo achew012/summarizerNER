@@ -1,6 +1,7 @@
 lightning_logs
 mlruns
 epoch=*
+best_entity*
 gen-arg/lightning_logs
 gen-arg/__pycache__
 qa/lightning_logs
