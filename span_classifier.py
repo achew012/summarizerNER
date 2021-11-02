@@ -1,14 +1,16 @@
 from clearml import Task, StorageManager, Dataset as ds
 import argparse, json, os, random, math, ipdb, jsonlines
- 
-# Task.add_requirements('transformers', package_version='4.2.0')
+
+Task.add_requirements("transformers", package_version="4.1.0") 
 task = Task.init(project_name='SpanClassifier', task_name='EntitySpanClassifier', tags=["maxpool"], output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
  
 # config = json.load(open('config.json'))
  
 config={
-    "lr": 3e-3,
+    "gamma": 5,
+    "alpha": 0.05,
+    "lr": 3e-5,
     "num_epochs":15,
     "train_batch_size":6,
     "eval_batch_size":2,
@@ -20,9 +22,9 @@ config={
 }
 
 args = argparse.Namespace(**config)
-# task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
-# task.execute_remotely(queue_name="128RAMv100", exit_process=True)
-# task.connect(args)
+task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+task.connect(args)
 
 # dataset = ds.get(dataset_name="processed-DWIE", dataset_project="datasets/DWIE", dataset_tags=["1st-mention"], only_published=True)
 # dataset_folder = dataset.get_local_copy()
@@ -31,7 +33,6 @@ args = argparse.Namespace(**config)
 dataset = ds.get(dataset_name="muc4-processed", dataset_project="datasets/muc4", dataset_tags=["processed", "GRIT"], only_published=True)
 dataset_folder = dataset.get_local_copy()
 print(list(os.walk(os.path.join(dataset_folder, "data/muc4-grit/processed"))))
-
 
 class bucket_ops:
     StorageManager.set_cache_file_limit(5, cache_context=None)
@@ -431,7 +432,7 @@ class NERLongformer(pl.LightningModule):
         span_clf_loss = None
         if labels!=None:
             #torch.count_nonzero(labels.view(-1))
-            loss_fct = WeightedFocalLoss(alpha=0.001, gamma=10)
+            loss_fct = WeightedFocalLoss(alpha=self.args.alpha, gamma=self.args.gamma)
             span_clf_loss = loss_fct(logits.view(-1), labels.view(-1))
             total_loss+=span_clf_loss
  
@@ -500,7 +501,7 @@ class NERLongformer(pl.LightningModule):
         
         for idx, (sample, tokens) in enumerate(zip(test_spans, test_text)):
             if idx in positive_docs:
-                template_spans = [self.tokenizer.convert_tokens_to_string(tokens[sample[val][0]: sample[val][1]]) for id, val in pred_indices_list if id==idx]
+                template_spans = [self.tokenizer.convert_tokens_to_string(tokens[sample[val][0]+1: sample[val][1]+1]) for id, val in pred_indices_list if id==idx]
                 docspans.append(template_spans)
             else:
                 docspans.append([])              
@@ -555,11 +556,11 @@ early_stop_callback = EarlyStopping(monitor="val_loss", patience=8, verbose=Fals
 model = NERLongformer(args)
 
 # trained_model_path = bucket_ops.get_file(
-#             remote_path="s3://experiment-logging/storage/SpanClassifier/EntitySpanClassifier.b7d4e482aa6044768d5e26bb995989bd/models/best_entity_lm-v3.ckpt"
+#             remote_path="s3://experiment-logging/storage/SpanClassifier/EntitySpanClassifier.206d902b9b8f4c05ae5ca1bfd93f3fbf/models/best_entity_lm-v2.ckpt"
 #             )
 # model = NERLongformer.load_from_checkpoint(trained_model_path, args = args)
 
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback, early_stop_callback])
-trainer.fit(model)
 
+trainer.fit(model)
 trainer.test(model)
