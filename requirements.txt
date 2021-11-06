@@ -1,7 +1,6 @@
-torch==1.8.1
-transformers==4.3.2
+transformers==4.1.0
 pytorch-lightning==1.0.8
+allennlp==2.6.0
+torch==1.7.1
 datasets
-rouge_score
 ipdb
-gpustat

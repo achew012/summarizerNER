@@ -9,7 +9,7 @@ from eval import eval_ceaf
 config = json.load(open('config.json'))
 args = argparse.Namespace(**config)
 
-task = Task.init(project_name='LongformerNER', task_name='simpleTokenClassification', tags=["muc4"], output_uri="s3://experiment-logging/storage/")
+task = Task.init(project_name='LongformerNER', task_name='simpleTokenClassification', tags=["muc4", "470 tokens"], output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
 # task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
@@ -350,7 +350,7 @@ class NERLongformer(pl.LightningModule):
 
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.model, use_fast=True)
-        self.tokenizer.model_max_length = 1024
+        self.tokenizer.model_max_length = self.args.max_input_len
         self.softmax = nn.Softmax(dim=-1)
         self.crf_layer = Transformer_CRF(num_labels=self.config.num_labels, start_label_id=self.tokenizer.cls_token_id)
 
@@ -614,13 +614,13 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
     period=5
 )
 
-trained_model_path = bucket_ops.get_file(
-            remote_path="s3://experiment-logging/storage/LongformerNER/simpleTokenClassification.9ec8ef5737544705bfb757ef25e04f02/models/best_ner_model.ckpt"
-            )
-model = NERLongformer.load_from_checkpoint(trained_model_path, params = args)
+# trained_model_path = bucket_ops.get_file(
+#             remote_path="s3://experiment-logging/storage/LongformerNER/simpleTokenClassification.9ec8ef5737544705bfb757ef25e04f02/models/best_ner_model.ckpt"
+#             )
+#model = NERLongformer.load_from_checkpoint(trained_model_path, params = args)
 
-#model = NERLongformer(args)
+model = NERLongformer(args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback])
-#trainer.fit(model)
+trainer.fit(model)
 results = trainer.test(model)
 

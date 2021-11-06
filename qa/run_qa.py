@@ -29,12 +29,17 @@ config = {
 "embedding_path":"s3://experiment-logging/storage/ner-pretraining/EntitySpanClassifier.af706f110ce84e189eb5d59c623a571d/models/best_entity_lm.ckpt",
 "model_name": "allenai/longformer-base-4096",
 #"model_name": "mrm8488/longformer-base-4096-finetuned-squadv2",  
-"debug": False
+"debug": False,
+"train": False
 }
 #json.load(open('config.json'))
 
 args = argparse.Namespace(**config)
-task = Task.init(project_name='LangGen', task_name='MRC-NER-PRETRAINEDSPANS-mlm+span_loss', output_uri="s3://experiment-logging/storage/")
+if args.train:
+    task = Task.init(project_name='LangGen', task_name='MRC-NER-train', output_uri="s3://experiment-logging/storage/")
+else:
+    task = Task.init(project_name='LangGen', task_name='MRC-NER-predict', output_uri="s3://experiment-logging/storage/")
+
 clearlogger = task.get_logger()
 
 task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
@@ -546,7 +551,7 @@ class NERLongformerQA(pl.LightningModule):
                         "qns": [sample["qns"]],
                         "gold_mention": [sample["gold_mention"]],
                         "gold": [sample["gold"]],
-                        "candidates": [sample["candidates"][:1]]
+                        "candidates": [sample["candidates"]]
                    }
                 else:
                     predictions[sample["docid"]]["qns"].append(sample["qns"])
@@ -659,5 +664,6 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
 #model = NERLongformerQA.load_from_checkpoint(trained_model_path, params = args)
 model = NERLongformerQA(args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback])
-trainer.fit(model)
+if args.train:
+    trainer.fit(model)
 results = trainer.test(model)

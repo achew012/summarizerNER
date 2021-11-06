@@ -2,14 +2,15 @@ from clearml import Task, StorageManager, Dataset as ds
 import argparse, json, os, random, math, ipdb, jsonlines
 
 Task.add_requirements("transformers", package_version="4.1.0") 
-task = Task.init(project_name='SpanClassifier', task_name='EntitySpanClassifier', tags=["maxpool"], output_uri="s3://experiment-logging/storage/")
+task = Task.init(project_name='SpanClassifier', task_name='EntitySpanClassifier-all_mentions', tags=[], output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
  
 # config = json.load(open('config.json'))
  
 config={
-    "gamma": 5,
+    "gamma": 8,
     "alpha": 0.05,
+    "width_embed_len": 300,
     "lr": 3e-5,
     "num_epochs":15,
     "train_batch_size":6,
@@ -22,9 +23,9 @@ config={
 }
 
 args = argparse.Namespace(**config)
+task.connect(args)
 task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
 task.execute_remotely(queue_name="128RAMv100", exit_process=True)
-task.connect(args)
 
 # dataset = ds.get(dataset_name="processed-DWIE", dataset_project="datasets/DWIE", dataset_tags=["1st-mention"], only_published=True)
 # dataset_folder = dataset.get_local_copy()
@@ -231,12 +232,12 @@ class NERDataset(Dataset):
             spans[len(spans):self.max_num_spans] = [(0,0,0)]*(self.max_num_spans-len(spans))
                 
             ### Only take the 1st label of each role
-            role_ans = [[key, doc["extracts"][key][0][0][1] if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][1]+len(doc["extracts"][key][0][0][0]) if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else ""] for key in doc["extracts"].keys()]
+            # role_ans = [[key, doc["extracts"][key][0][0][1] if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][1]+len(doc["extracts"][key][0][0][0]) if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else ""] for key in doc["extracts"].keys()]
 
             context_encodings = self.tokenizer(context, padding="max_length", truncation=True, max_length=self.tokenizer.model_max_length, return_offsets_mapping=True, return_tensors="pt")
     
             ### expand on all labels in each role
-            # role_ans = [[key, mention[1] if len(mention)>0 else 0, mention[1]+len(mention[0]) if len(mention)>0 else 0, mention[0] if len(mention)>0 else ""] for key in doc["extracts"].keys() for cluster in doc["extracts"][key] for mention in cluster]    
+            role_ans = [[key, mention[1] if len(mention)>0 else 0, mention[1]+len(mention[0]) if len(mention)>0 else 0, mention[0] if len(mention)>0 else ""] for key in doc["extracts"].keys() for cluster in doc["extracts"][key] for mention in cluster]    
 
             entity_spans = get_entity_token_id(context_encodings, role_ans)
             entity_spans = [span for span in entity_spans if span!=[0,0,0]]
@@ -323,13 +324,13 @@ class NERLongformer(pl.LightningModule):
         self.dropout = nn.Dropout(0.1)
  
         self.classifier = nn.Sequential(
-            nn.Linear(self.config.hidden_size*2+150, self.config.hidden_size),
+            nn.Linear(self.config.hidden_size*2+self.args.width_embed_len, self.config.hidden_size),
             nn.ReLU(),
             nn.Linear(self.config.hidden_size, 1),
             # nn.Sigmoid(),
          )
         # self.size_embeddings = nn.Embedding(self.args.max_span_len, self.config.hidden_size)
-        self.width_embedding = nn.Embedding(self.args.max_span_len+1, 150)
+        self.width_embedding = nn.Embedding(self.args.max_span_len+1, self.args.width_embed_len)
 
     def test_dataloader(self):
         test = muc4["test"]
@@ -501,7 +502,7 @@ class NERLongformer(pl.LightningModule):
         
         for idx, (sample, tokens) in enumerate(zip(test_spans, test_text)):
             if idx in positive_docs:
-                template_spans = [self.tokenizer.convert_tokens_to_string(tokens[sample[val][0]+1: sample[val][1]+1]) for id, val in pred_indices_list if id==idx]
+                template_spans = [self.tokenizer.convert_tokens_to_string(tokens[sample[val][0]+1: sample[val][1]+2]) for id, val in pred_indices_list if id==idx]
                 docspans.append(template_spans)
             else:
                 docspans.append([])              
