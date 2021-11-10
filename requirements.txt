@@ -1,6 +1,5 @@
 transformers==4.1.0
 pytorch-lightning==1.0.8
 allennlp==2.6.0
-torch==1.7.1
 datasets
 ipdb

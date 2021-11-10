@@ -12,9 +12,9 @@ args = argparse.Namespace(**config)
 task = Task.init(project_name='LongformerNER', task_name='simpleTokenClassification', tags=["muc4", "470 tokens"], output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
-# task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
-# task.connect(args)
-# task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
+task.connect(args)
+task.execute_remotely(queue_name="128RAMv100", exit_process=True)
 
 ''' Writes to a jsonl file'''
 def to_jsonl(filename:str, file_obj):
@@ -116,7 +116,7 @@ class NERDataset(Dataset):
             qns_ans = [[key, doc["extracts"][key][0][0][1] if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][1]+len(doc["extracts"][key][0][0][0]) if len(doc["extracts"][key])>0 else 0, doc["extracts"][key][0][0][0] if len(doc["extracts"][key])>0 else ""] for key in doc["extracts"].keys()]    
 
             ### expand on all labels in each role
-            #qns_ans = [["who are the {} entities?".format(role_map[key].lower()), mention[1] if len(mention)>0 else 0, mention[1]+len(mention[0]) if len(mention)>0 else 0, mention[0] if len(mention)>0 else ""] for key in doc["extracts"].keys() for cluster in doc["extracts"][key] for mention in cluster]    
+            # qns_ans = [[key, mention[1] if len(mention)>0 else 0, mention[1]+len(mention[0]) if len(mention)>0 else 0, mention[0] if len(mention)>0 else ""] for key in doc["extracts"].keys() for cluster in doc["extracts"][key] for mention in cluster]    
 
             #labels = [-100]*(self.tokenizer.model_max_length)
             labels = [self.labels2idx["O"]]*(self.tokenizer.model_max_length)
@@ -173,7 +173,7 @@ class NERDataset(Dataset):
             self.processed_dataset["context"].append(context)
             self.processed_dataset["input_ids"].append(context_encodings["input_ids"].squeeze(0))
             self.processed_dataset["attention_mask"].append(context_encodings["attention_mask"].squeeze(0))
-            self.processed_dataset["gold_mentions"].append(mention)
+            # self.processed_dataset["gold_mentions"].append(mention)
             self.processed_dataset["labels"].append(torch.tensor(labels))
 
     def __len__(self):

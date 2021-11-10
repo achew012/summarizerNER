@@ -1,6 +1,6 @@
 from clearml import Task, StorageManager, Dataset
 import argparse
-import json, os
+import json, os, sys
 import jsonlines
 import ipdb
 from collections import OrderedDict
@@ -17,18 +17,18 @@ config = {
 "data_dir": "/data",
 "output_dir": "./saved_models/test", 
 "val_every": 0.33, 
-"max_input_len": 2048, 
+"max_input_len": 470, 
 "batch_size": 4, 
-"eval_batch_size": 4, 
+"eval_batch_size": 10, 
 "grad_accum": 1, 
 "fp16": False, 
 "grad_ckpt": True, 
 "attention_window": 256,
 "num_epochs": 15,
-"use_entity_embeddings": True,
+"use_entity_embeddings": False,
 "embedding_path":"s3://experiment-logging/storage/ner-pretraining/EntitySpanClassifier.af706f110ce84e189eb5d59c623a571d/models/best_entity_lm.ckpt",
-"model_name": "allenai/longformer-base-4096",
-#"model_name": "mrm8488/longformer-base-4096-finetuned-squadv2",  
+#"model_name": "allenai/longformer-base-4096",
+"model_name": "mrm8488/longformer-base-4096-finetuned-squadv2",  
 "debug": False,
 "train": False
 }
@@ -42,9 +42,9 @@ else:
 
 clearlogger = task.get_logger()
 
-task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
 task.connect(args)
-task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+task.set_base_docker("nvidia/cuda:11.4.0-runtime-ubuntu20.04")
+task.execute_remotely(queue_name="compute", exit_process=True)
 
 class bucket_ops:
     StorageManager.set_cache_file_limit(5, cache_context=None)
@@ -109,8 +109,11 @@ from torch import nn
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoConfig, AutoModelForSeq2SeqLM, set_seed, get_linear_schedule_with_warmup
-from seqeval.metrics import f1_score, precision_score, recall_score, accuracy_score
 from eval import eval_ceaf
+
+print("CUDA: ", torch.cuda.is_available())
+
+#sys.exit()
 
 role_map = {
     'PerpOrg': 'perpetrator organizations', 
@@ -391,17 +394,16 @@ class NERLongformerQA(pl.LightningModule):
     def forward(self, **batch): 
         input_ids, attention_mask = batch["input_ids"], batch["attention_mask"], 
 
-        span_embeds = self.span_embeds(input_ids, attention_mask).last_hidden_state
-
-        inputs_embeds = torch.sum(torch.stack([self.model.longformer.embeddings(input_ids), span_embeds], dim=0), dim=0)
+        #span_embeds = self.span_embeds(input_ids, attention_mask).last_hidden_state
+        #inputs_embeds = torch.sum(torch.stack([self.model.longformer.embeddings(input_ids), span_embeds], dim=0), dim=0)
 
         if "start_positions" in batch.keys():
             start, end = batch["start_positions"], batch["end_positions"]
             self.model.longformer.embeddings(input_ids)
 
             outputs = self.model(
-                            #input_ids=input_ids,
-                            inputs_embeds = inputs_embeds,
+                            input_ids=input_ids,
+                            #inputs_embeds = inputs_embeds,
                             attention_mask=attention_mask,  # mask padding tokens
                             global_attention_mask=self._set_global_attention_mask(input_ids),
                             start_positions=start,
@@ -428,7 +430,7 @@ class NERLongformerQA(pl.LightningModule):
     def _get_dataloader(self, split_name, is_train):
         """Get training and validation dataloaders"""
         if self.args.debug:
-            dataset_split = self.dataset[split_name]
+            dataset_split = self.dataset[split_name][:10]
         else:
             dataset_split = self.dataset[split_name]
 
@@ -496,6 +498,11 @@ class NERLongformerQA(pl.LightningModule):
                     else:
                         valid_candidates.append((start_index.item(), end_index.item(),  self.tokenizer.decode(tokens[start_index:end_index]), (start_score+end_score).item()))
 
+
+            score_list = [candidate[3] for candidate in valid_candidates]
+            top_5 = sorted(score_list, reverse=True)[:5]
+            threshold = max(score_list) #-5
+            
             batch_outputs.append(
                 {
                     "docid": docid,
@@ -505,7 +512,9 @@ class NERLongformerQA(pl.LightningModule):
                     "start_gold": start_gold.item(),
                     "end_gold": end_gold.item(),
                     "gold": self.tokenizer.decode(tokens[start_gold:end_gold]),
-                    "candidates": valid_candidates[:5]
+                    #"candidates": [candidate for candidate in valid_candidates if candidate[3] in top_5]
+                    # "candidates": [candidate for candidate in valid_candidates if candidate[3]>threshold]
+                    "candidates": [candidate for candidate in valid_candidates if candidate[3]==threshold]
                 }
             )
 
@@ -532,7 +541,11 @@ class NERLongformerQA(pl.LightningModule):
     #################################################################################
     def test_epoch_end(self, outputs):
         #gold_list = NERDataset(dataset=self.dataset["test"], tokenizer=self.tokenizer, args=self.args).processed_dataset["gold_mentions"]       
-        pred_list = []
+
+        # pred_list = []
+        
+        span_clf_task = Task.get_task(task_id='87a8509b524040e6bc7f52cdb8a0d0ce')
+        span_preds = read_json(span_clf_task.artifacts['predictions'].get_local_copy())
 
         logs={}
         doctexts_tokens, golds = read_golds_from_test_file(os.path.join(dataset_folder, "data/muc4-grit/processed/"), self.tokenizer)
@@ -543,7 +556,12 @@ class NERLongformerQA(pl.LightningModule):
         predictions = {}
         for batch in outputs:
             for sample in batch["results"]:                
-                pred_list.append(sample["candidates"][:1][0][2] if sample["candidates"][:1][0][2]!="</s>" else "")
+                # ipdb.set_trace()
+                # if len(sample["candidates"])>0:
+                #     pred_list.append(sample["candidates"][:1][0][2] if sample["candidates"][:1][0][2]!="</s>" else "")
+                # else:
+                #     pred_list.append("")
+
                 if sample["docid"] not in predictions.keys():
                     predictions[sample["docid"]]={
                         "docid": sample["docid"],
@@ -552,15 +570,15 @@ class NERLongformerQA(pl.LightningModule):
                         "gold_mention": [sample["gold_mention"]],
                         "gold": [sample["gold"]],
                         "candidates": [sample["candidates"]]
-                   }
+                }
                 else:
                     predictions[sample["docid"]]["qns"].append(sample["qns"])
                     predictions[sample["docid"]]["gold_mention"].append(sample["gold_mention"])
                     predictions[sample["docid"]]["gold"].append(sample["gold"])
-                    predictions[sample["docid"]]["candidates"].append(sample["candidates"][:1])
+                    predictions[sample["docid"]]["candidates"].append(sample["candidates"])
 
         preds = OrderedDict()
-        for key, doc in predictions.items():
+        for (key, doc), ent_spans in zip(predictions.items(), span_preds):
             if key not in preds:
                 preds[key] = OrderedDict()
                 for idx, role in enumerate(role_list):
@@ -568,10 +586,24 @@ class NERLongformerQA(pl.LightningModule):
                     if idx+1 > len(doc["candidates"]): 
                         continue
                     elif doc["candidates"][idx]:
-                        if doc["candidates"][idx][0][2]=="</s>":
-                            continue
-                        else:    
-                            preds[key][role] = [[doc["candidates"][idx][0][2].replace("</s>", "")]]                
+                        
+                        # if doc["candidates"][idx][0][2]!="</s>":
+                        #     filtered_candidates = set(ent_spans).intersection(set(candidate[2].replace("</s>", "").strip() for candidate in doc["candidates"][idx]))
+                        #     filtered_candidates = filtered_candidates.union(set(candidate[2].replace("</s>", "").strip() for candidate in doc["candidates"][idx]))
+                        # else:
+                        #     filtered_candidates = []
+                        # preds[key][role] = [[candidate] for candidate in filtered_candidates]
+
+                        filtered_candidates = doc["candidates"][idx]
+                        for candidate in filtered_candidates:
+                            #if doc["candidates"][idx][0][2]=="</s>":
+                            if candidate[2]=="</s>":
+                                continue
+                            else:
+                                preds[key][role] = [[candidate[2].replace("</s>", "")]]                
+                                #preds[key][role] = [[candidate]]                
+
+        # ipdb.set_trace()
 
         preds_list = [{**doc, "docid": key} for key, doc in preds.items()]
         results = eval_ceaf(preds, golds)
@@ -648,9 +680,9 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
 )
 
 #base
-# trained_model_path = bucket_ops.get_file(
-#             remote_path="s3://experiment-logging/storage/LangGen/promptNER-QA-Base.7ffa23a05839464980272aa317353fc3/models/best_ner_model.ckpt"
-#             )
+trained_model_path = bucket_ops.get_file(
+            remote_path="s3://experiment-logging/storage/LangGen/promptNER-QA-Base.7ffa23a05839464980272aa317353fc3/models/best_ner_model.ckpt"
+            )
 
 #squad-finetune
 # trained_model_path = bucket_ops.get_file(
@@ -661,8 +693,8 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
 #             remote_path="s3://experiment-logging/storage/LangGen/MRC-NER-PRETRAINSSPANS.962f18a7e03b4c99a18972f53b667d42/models/best_ner_model.ckpt"
 #             )
 
-#model = NERLongformerQA.load_from_checkpoint(trained_model_path, params = args)
-model = NERLongformerQA(args)
+model = NERLongformerQA.load_from_checkpoint(trained_model_path, params = args)
+#model = NERLongformerQA(args)
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback])
 if args.train:
     trainer.fit(model)

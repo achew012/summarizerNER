@@ -13,21 +13,21 @@ task = Task.init(project_name="SpanClassifier", task_name="EntitySpanClassifierS
 task.set_base_docker("python:slim-buster")
 task.execute_remotely(queue_name="services", exit_process=True)
 
-TEMPLATE_TASK_ID = 'ed976ab7b5df469392e3fc4a61237b7c'
+TEMPLATE_TASK_ID = '5e94f68047bc414bbc42f69d3899f46c'
 
 optimizer = HyperParameterOptimizer(
     base_task_id=TEMPLATE_TASK_ID,  # This is the experiment we want to optimize
     
     # here we define the hyper-parameters to optimize
     hyper_parameters=[
-        UniformParameterRange('General/alpha', min_value=0.1, max_value=1, step_size=0.1),
+        UniformParameterRange('General/alpha', min_value=0.05, max_value=1, step_size=0.1),
         UniformParameterRange('General/gamma', min_value=5, max_value=10, step_size=0.5),
-        UniformParameterRange('General/lr', min_value=3e-05, max_value=3e-04, step_size=0.0001),
+        # UniformParameterRange('General/lr', min_value=3e-05, max_value=3e-04, step_size=0.0001),
     ],
 
     # setting the objective metric we want to maximize/minimize
-    objective_metric_title='f1',
-    objective_metric_series='val',
+    objective_metric_title='test_f1',
+    objective_metric_series='test_f1',
     objective_metric_sign='max',  # maximize or minimize the objective metric
 
     # setting optimizer - clearml supports GridSearch, RandomSearch, OptimizerBOHB and OptimizerOptuna

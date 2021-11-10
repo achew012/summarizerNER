@@ -1,35 +1,35 @@
 from clearml import Task, StorageManager, Dataset as ds
 import argparse, json, os, random, math, ipdb, jsonlines
-
-Task.add_requirements("transformers", package_version="4.1.0") 
-task = Task.init(project_name='SpanClassifier', task_name='EntitySpanClassifier-all_mentions', tags=[], output_uri="s3://experiment-logging/storage/")
-clearlogger = task.get_logger()
  
 # config = json.load(open('config.json'))
- 
 config={
-    "gamma": 8,
-    "alpha": 0.05,
+    "gamma": 20,
+    "alpha": 0.1,
     "width_embed_len": 300,
     "lr": 3e-5,
-    "num_epochs":15,
-    "train_batch_size":6,
+    "num_epochs":20,
+    "train_batch_size":4,
     "eval_batch_size":2,
-    "max_length": 1024, # be mindful underlength will cause device cuda side error
+    "max_length": 2048, # be mindful underlength will cause device cuda side error
     "max_span_len": 8,
     "max_num_spans":1024*3,
-    "mlm_task": False,
-    "bio_task": False,
+    "dataset": "dwie",
+    "train": False
 }
 
 args = argparse.Namespace(**config)
+
+Task.add_requirements("transformers", package_version="4.1.0") 
+task = Task.init(project_name='SpanClassifier', task_name='EntitySpanClassifier', tags=["maxpool", args.dataset], output_uri="s3://experiment-logging/storage/")
+clearlogger = task.get_logger()
+
 task.connect(args)
 task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
 task.execute_remotely(queue_name="128RAMv100", exit_process=True)
 
-# dataset = ds.get(dataset_name="processed-DWIE", dataset_project="datasets/DWIE", dataset_tags=["1st-mention"], only_published=True)
-# dataset_folder = dataset.get_local_copy()
-# dwie = json.load(open(os.path.join(dataset_folder, "data", "new_dwie.json")))["dataset"]
+dataset = ds.get(dataset_name="processed-DWIE", dataset_project="datasets/DWIE", dataset_tags=["1st-mention"], only_published=True)
+dataset_folder = dataset.get_local_copy()
+dwie = json.load(open(os.path.join(dataset_folder, "data", "new_dwie.json")))["dataset"]
  
 dataset = ds.get(dataset_name="muc4-processed", dataset_project="datasets/muc4", dataset_tags=["processed", "GRIT"], only_published=True)
 dataset_folder = dataset.get_local_copy()
@@ -91,10 +91,8 @@ from sklearn.utils.class_weight import compute_class_weight
 import numpy as np
 from sklearn.metrics import classification_report, precision_recall_fscore_support
 
-from allennlp.nn.util import batched_index_select
+from typing import Callable, Any, Dict, List, Tuple, Optional, Sequence, Tuple, TypeVar, Union, NamedTuple
 
-from typing import Callable, List, Set, Tuple, TypeVar, Optional
- 
 class WeightedFocalLoss(nn.Module):
     "Non weighted version of Focal Loss"
     def __init__(self, alpha=.25, gamma=2):
@@ -109,6 +107,132 @@ class WeightedFocalLoss(nn.Module):
         pt = torch.exp(-BCE_loss)
         F_loss = at*(1-pt)**self.gamma * BCE_loss
         return F_loss.mean()
+
+class ConfigurationError(Exception):
+    """
+    The exception raised by any AllenNLP object when it's misconfigured
+    (e.g. missing properties, invalid properties, unknown properties).
+    """
+
+    def __reduce__(self) -> Union[str, Tuple[Any, ...]]:
+        return type(self), (self.message,)
+
+    def __init__(self, message: str):
+        super().__init__()
+        self.message = message
+
+    def __str__(self):
+        return self.message
+
+def get_range_vector(size: int, device: int) -> torch.Tensor:
+    """
+    Returns a range vector with the desired size, starting at 0. The CUDA implementation
+    is meant to avoid copy data from CPU to GPU.
+    """
+    if device > -1:
+        return torch.cuda.LongTensor(size, device=device).fill_(1).cumsum(0) - 1
+    else:
+        return torch.arange(0, size, dtype=torch.long)
+
+def flatten_and_batch_shift_indices(indices: torch.Tensor, sequence_length: int) -> torch.Tensor:
+    """
+    This is a subroutine for [`batched_index_select`](./util.md#batched_index_select).
+    The given `indices` of size `(batch_size, d_1, ..., d_n)` indexes into dimension 2 of a
+    target tensor, which has size `(batch_size, sequence_length, embedding_size)`. This
+    function returns a vector that correctly indexes into the flattened target. The sequence
+    length of the target must be provided to compute the appropriate offsets.
+    ```python
+        indices = torch.ones([2,3], dtype=torch.long)
+        # Sequence length of the target tensor.
+        sequence_length = 10
+        shifted_indices = flatten_and_batch_shift_indices(indices, sequence_length)
+        # Indices into the second element in the batch are correctly shifted
+        # to take into account that the target tensor will be flattened before
+        # the indices are applied.
+        assert shifted_indices == [1, 1, 1, 11, 11, 11]
+    ```
+    # Parameters
+    indices : `torch.LongTensor`, required.
+    sequence_length : `int`, required.
+        The length of the sequence the indices index into.
+        This must be the second dimension of the tensor.
+    # Returns
+    offset_indices : `torch.LongTensor`
+    """
+    # Shape: (batch_size)
+    if torch.max(indices) >= sequence_length or torch.min(indices) < 0:
+        raise ConfigurationError(
+            f"All elements in indices should be in range (0, {sequence_length - 1})"
+        )
+    offsets = get_range_vector(indices.size(0), get_device_of(indices)) * sequence_length
+    for _ in range(len(indices.size()) - 1):
+        offsets = offsets.unsqueeze(1)
+
+    # Shape: (batch_size, d_1, ..., d_n)
+    offset_indices = indices + offsets
+
+    # Shape: (batch_size * d_1 * ... * d_n)
+    offset_indices = offset_indices.view(-1)
+    return offset_indices
+
+def batched_index_select(
+    target: torch.Tensor,
+    indices: torch.LongTensor,
+    flattened_indices: Optional[torch.LongTensor] = None,
+) -> torch.Tensor:
+    """
+    The given `indices` of size `(batch_size, d_1, ..., d_n)` indexes into the sequence
+    dimension (dimension 2) of the target, which has size `(batch_size, sequence_length,
+    embedding_size)`.
+    This function returns selected values in the target with respect to the provided indices, which
+    have size `(batch_size, d_1, ..., d_n, embedding_size)`. This can use the optionally
+    precomputed `flattened_indices` with size `(batch_size * d_1 * ... * d_n)` if given.
+    An example use case of this function is looking up the start and end indices of spans in a
+    sequence tensor. This is used in the
+    [CoreferenceResolver](https://docs.allennlp.org/models/main/models/coref/models/coref/)
+    model to select contextual word representations corresponding to the start and end indices of
+    mentions.
+    The key reason this can't be done with basic torch functions is that we want to be able to use look-up
+    tensors with an arbitrary number of dimensions (for example, in the coref model, we don't know
+    a-priori how many spans we are looking up).
+    # Parameters
+    target : `torch.Tensor`, required.
+        A 3 dimensional tensor of shape (batch_size, sequence_length, embedding_size).
+        This is the tensor to be indexed.
+    indices : `torch.LongTensor`
+        A tensor of shape (batch_size, ...), where each element is an index into the
+        `sequence_length` dimension of the `target` tensor.
+    flattened_indices : `Optional[torch.Tensor]`, optional (default = `None`)
+        An optional tensor representing the result of calling `flatten_and_batch_shift_indices`
+        on `indices`. This is helpful in the case that the indices can be flattened once and
+        cached for many batch lookups.
+    # Returns
+    selected_targets : `torch.Tensor`
+        A tensor with shape [indices.size(), target.size(-1)] representing the embedded indices
+        extracted from the batch flattened target tensor.
+    """
+    if flattened_indices is None:
+        # Shape: (batch_size * d_1 * ... * d_n)
+        flattened_indices = flatten_and_batch_shift_indices(indices, target.size(1))
+
+    # Shape: (batch_size * sequence_length, embedding_size)
+    flattened_target = target.view(-1, target.size(-1))
+
+    # Shape: (batch_size * d_1 * ... * d_n, embedding_size)
+    flattened_selected = flattened_target.index_select(0, flattened_indices)
+    selected_shape = list(indices.size()) + [target.size(-1)]
+    # Shape: (batch_size, d_1, ..., d_n, embedding_size)
+    selected_targets = flattened_selected.view(*selected_shape)
+    return selected_targets
+
+def get_device_of(tensor: torch.Tensor) -> int:
+    """
+    Returns the device of the tensor.
+    """
+    if not tensor.is_cuda:
+        return -1
+    else:
+        return tensor.get_device()
 
 def enumerate_spans(
     sentence: List,
@@ -196,12 +320,75 @@ def get_entity_token_id(context_encodings, role_ans:list):
 
     return entity_spans
 
+class DWIE_Data(Dataset):
+    def __init__(self, dataset, tokenizer, args):
+        self.args = args
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.processed_dataset = {
+            "docid": [],
+            "context": [],
+            "input_ids": [],
+            "attention_mask": [],
+            "gold_mentions": [],
+            "labels":[],
+            "span_len_mask":[],
+            "spans": []
+        }
+        self.max_num_spans = args.max_num_spans
+        self.max_span_len = args.max_span_len
+
+        for idx, doc in enumerate(self.dataset):
+            context = ' '.join(doc["sentences"])
+            tokens = self.tokenizer.tokenize(context)
+            context_len = len(tokens)
+            spans = enumerate_spans(tokens, min_span_width=1, max_span_width=self.max_span_len)[:self.max_num_spans]
+            spans = [(span[0], span[1], span[1]-span[0]) for span in spans]
+            spans[len(spans):self.max_num_spans] = [(0,0,0)]*(self.max_num_spans-len(spans))
+
+            context_encodings = self.tokenizer(context, padding="max_length", truncation=True, max_length=self.tokenizer.model_max_length, return_tensors="pt")
+
+            entity_spans = [(entity["start"],entity["end"], entity["end"]-entity["start"])  for entity in doc["entities"] if entity["start"]<self.tokenizer.model_max_length]
+            entity_spans = [span for span in entity_spans if span!=[0,0,0]]
+            labels = [1.0 if (list(span) in entity_spans) else 0.0 for span in spans]
+
+            self.processed_dataset["input_ids"].append(context_encodings["input_ids"]),
+            self.processed_dataset["attention_mask"].append(context_encodings["attention_mask"]),
+            self.processed_dataset["spans"].append(torch.tensor(spans))
+            self.processed_dataset["labels"].append(torch.tensor(labels))
+            # self.processed_dataset["span_len_mask"].append(torch.stack(span_len_mask))
+ 
+    def __len__(self):
+        return len(self.processed_dataset["input_ids"])
+ 
+    def __getitem__(self, idx):
+        item={}
+        item['input_ids'] = self.processed_dataset["input_ids"][idx]
+        item['attention_mask'] = self.processed_dataset["attention_mask"][idx]
+        # item['span_len_mask'] = self.processed_dataset["span_len_mask"][idx]
+        item['spans'] = self.processed_dataset["spans"][idx]
+        item['labels'] = self.processed_dataset["labels"][idx]
+        return item
+
+    def collate_fn(self, batch):
+        input_ids = torch.stack([ex['input_ids'] for ex in batch]).squeeze(1) 
+        attention_mask = torch.stack([ex['attention_mask'] for ex in batch]).squeeze(1)
+        spans = torch.stack([ex['spans'] for ex in batch])
+        labels = torch.stack([ex['labels'] for ex in batch])
+        # span_len_mask = torch.stack([ex["span_len_mask"] for ex in batch])
+         
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "spans": spans,
+            "labels": labels,
+        }
+
 class NERDataset(Dataset):
     def __init__(self, dataset, tokenizer, args):
         self.args = args
         self.dataset = dataset
         self.tokenizer = tokenizer
-        self.consolidated_dataset = []
         self.max_num_spans = args.max_num_spans
         self.args = args
 
@@ -333,20 +520,33 @@ class NERLongformer(pl.LightningModule):
         self.width_embedding = nn.Embedding(self.args.max_span_len+1, self.args.width_embed_len)
 
     def test_dataloader(self):
-        test = muc4["test"]
-        test_data = NERDataset(test, self.tokenizer, self.args)
+        if self.args.dataset=="muc4":
+            test = muc4["test"]
+            test_data = NERDataset(test, self.tokenizer, self.args)
+        else:
+            test = dwie["test"]
+            test_data = DWIE_Data(test, self.tokenizer, self.args)
         test_dataloader = DataLoader(test_data, batch_size=self.args.eval_batch_size, collate_fn = test_data.collate_fn)
+
         return test_dataloader
 
     def val_dataloader(self):
-        val = muc4["val"]
-        val_data = NERDataset(val, self.tokenizer, self.args)
+        if self.args.dataset=="muc4":
+            val = muc4["val"]
+            val_data = NERDataset(val, self.tokenizer, self.args)
+        else:
+            val = dwie["test"]
+            val_data = DWIE_Data(val, self.tokenizer, self.args)
         val_dataloader = DataLoader(val_data, batch_size=self.args.eval_batch_size, collate_fn = val_data.collate_fn)
         return val_dataloader
  
     def train_dataloader(self):
-        train = muc4["train"]
-        train_data = NERDataset(train, self.tokenizer, self.args)
+        if self.args.dataset=="muc4":
+            train = muc4["train"]
+            train_data = NERDataset(train, self.tokenizer, self.args)
+        else:
+            train = dwie["train"]
+            train_data = DWIE_Data(train, self.tokenizer, self.args)
         train_dataloader = DataLoader(train_data, batch_size=self.args.train_batch_size, collate_fn = train_data.collate_fn)
         return train_dataloader
 
@@ -494,6 +694,7 @@ class NERLongformer(pl.LightningModule):
         target_indices = torch.nonzero(test_labels).squeeze()
         matches = np.intersect1d(pred_indices.cpu(), target_indices.cpu())
 
+        # list of (sample_idx, position)
         pred_indices_list = [[pred_idx[0],pred_idx[1]] for pred_idx in pred_indices.cpu().detach().tolist()]
         positive_docs = set([element[0] for element in pred_indices_list])
         
@@ -502,7 +703,7 @@ class NERLongformer(pl.LightningModule):
         
         for idx, (sample, tokens) in enumerate(zip(test_spans, test_text)):
             if idx in positive_docs:
-                template_spans = [self.tokenizer.convert_tokens_to_string(tokens[sample[val][0]+1: sample[val][1]+2]) for id, val in pred_indices_list if id==idx]
+                template_spans = [self.tokenizer.convert_tokens_to_string(tokens[sample[val][0]+1:sample[val][1]+2]).strip() for id, val in pred_indices_list if id==idx]
                 docspans.append(template_spans)
             else:
                 docspans.append([])              
@@ -510,9 +711,9 @@ class NERLongformer(pl.LightningModule):
         to_jsonl("./predictions.jsonl", docspans)
         task.upload_artifact(name="predictions", artifact_object="./predictions.jsonl")
 
-        precision = len(matches)/len(pred_indices.cpu())
-        recall = len(matches)/len(target_indices.cpu())
-        f1 = 2*(precision*recall) / (precision+recall)
+        precision = len(matches)/(len(pred_indices.cpu())+0.000000000001)
+        recall = len(matches)/(len(target_indices.cpu())+0.000000000001)
+        f1 = 2*(precision*recall) / ((precision+recall)+0.000000000001)
 
         logs = {
             "test_loss": test_loss_mean,
@@ -554,14 +755,16 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
 
 early_stop_callback = EarlyStopping(monitor="val_loss", patience=8, verbose=False, mode="min")
 
-model = NERLongformer(args)
+#model = NERLongformer(args)
 
-# trained_model_path = bucket_ops.get_file(
-#             remote_path="s3://experiment-logging/storage/SpanClassifier/EntitySpanClassifier.206d902b9b8f4c05ae5ca1bfd93f3fbf/models/best_entity_lm-v2.ckpt"
-#             )
-# model = NERLongformer.load_from_checkpoint(trained_model_path, args = args)
+trained_model_path = bucket_ops.get_file(
+            remote_path="s3://experiment-logging/storage/SpanClassifier/EntitySpanClassifier.206d902b9b8f4c05ae5ca1bfd93f3fbf/models/best_entity_lm-v2.ckpt"
+            )
+model = NERLongformer.load_from_checkpoint(trained_model_path, args = args)
 
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback, early_stop_callback])
 
-trainer.fit(model)
+if args.train:
+    trainer.fit(model)
+
 trainer.test(model)
