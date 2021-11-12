@@ -3,18 +3,21 @@ import argparse, json, os, random, math, ipdb, jsonlines
  
 # config = json.load(open('config.json'))
 config={
-    "gamma": 20,
+    "gamma": 10,
     "alpha": 0.1,
+    "dice_smooth": 1,
+    "dice_ohem": 0.8,
+    "dice_alpha": 0.01,
     "width_embed_len": 300,
     "lr": 3e-5,
-    "num_epochs":20,
-    "train_batch_size":4,
-    "eval_batch_size":2,
+    "num_epochs":50,
+    "train_batch_size":12,
+    "eval_batch_size":6,
     "max_length": 2048, # be mindful underlength will cause device cuda side error
     "max_span_len": 8,
     "max_num_spans":1024*3,
-    "dataset": "dwie",
-    "train": False
+    "dataset": "muc4",
+    "train": True
 }
 
 args = argparse.Namespace(**config)
@@ -25,7 +28,7 @@ clearlogger = task.get_logger()
 
 task.connect(args)
 task.set_base_docker("nvidia/cuda:10.2-cudnn7-devel-ubuntu18.04")
-task.execute_remotely(queue_name="128RAMv100", exit_process=True)
+task.execute_remotely(queue_name="compute", exit_process=True)
 
 dataset = ds.get(dataset_name="processed-DWIE", dataset_project="datasets/DWIE", dataset_tags=["1st-mention"], only_published=True)
 dataset_folder = dataset.get_local_copy()
@@ -92,6 +95,9 @@ import numpy as np
 from sklearn.metrics import classification_report, precision_recall_fscore_support
 
 from typing import Callable, Any, Dict, List, Tuple, Optional, Sequence, Tuple, TypeVar, Union, NamedTuple
+
+from loss.focal_loss import FocalLoss
+from loss.dice_loss import DiceLoss
 
 class WeightedFocalLoss(nn.Module):
     "Non weighted version of Focal Loss"
@@ -281,9 +287,11 @@ def enumerate_spans(
                 spans.append((start, end))
     return spans
 
-def get_entity_token_id(context_encodings, role_ans:list):
+def get_entity_token_id(context_encodings, role_ans:list, label_idx=None):
     overflow_count = 0
     entity_spans=[]            
+    entity_labels=[]
+
     for role, ans_char_start, ans_char_end, mention in role_ans:
         sequence_ids = context_encodings.sequence_ids()
 
@@ -633,7 +641,10 @@ class NERLongformer(pl.LightningModule):
         span_clf_loss = None
         if labels!=None:
             #torch.count_nonzero(labels.view(-1))
-            loss_fct = WeightedFocalLoss(alpha=self.args.alpha, gamma=self.args.gamma)
+            #loss_fct = WeightedFocalLoss(alpha=self.args.alpha, gamma=self.args.gamma)
+            loss_fct = DiceLoss(with_logits=True, smooth=self.args.dice_smooth, ohem_ratio=self.args.dice_ohem,
+                                alpha=self.args.dice_alpha, square_denominator=None,
+                                reduction="mean", index_label_position=False)
             span_clf_loss = loss_fct(logits.view(-1), labels.view(-1))
             total_loss+=span_clf_loss
  
@@ -655,8 +666,8 @@ class NERLongformer(pl.LightningModule):
  
     def validation_epoch_end(self, outputs):
         val_loss_mean = torch.stack([x["val_loss"] for x in outputs]).mean()
-        val_preds = torch.stack([x["preds"] for x in outputs], dim=-1).view(-1, self.args.max_num_spans)#.cpu().detach().tolist()
-        val_labels = torch.stack([x["labels"] for x in outputs], dim=-1).view(-1, self.args.max_num_spans)#.cpu().detach().tolist()
+        val_preds = torch.cat([x["preds"] for x in outputs]).view(-1, self.args.max_num_spans)#.cpu().detach().tolist()
+        val_labels = torch.cat([x["labels"] for x in outputs]).view(-1, self.args.max_num_spans)#.cpu().detach().tolist()
     
         pred_indices = torch.nonzero(val_preds).squeeze()
         target_indices = torch.nonzero(val_labels).squeeze()
@@ -686,9 +697,9 @@ class NERLongformer(pl.LightningModule):
 
     def test_epoch_end(self, outputs):
         test_loss_mean = torch.stack([x["test_loss"] for x in outputs]).mean()
-        test_spans = torch.stack([x["spans"] for x in outputs]).view(-1, self.args.max_num_spans, 3).cpu().detach().tolist()
-        test_preds = torch.stack([x["preds"] for x in outputs]).view(-1, self.args.max_num_spans)#.cpu().detach().tolist()
-        test_labels = torch.stack([x["labels"] for x in outputs]).view(-1, self.args.max_num_spans)#.cpu().detach().tolist()
+        test_spans = torch.cat([x["spans"] for x in outputs]).view(-1, self.args.max_num_spans, 3).cpu().detach().tolist()
+        test_preds = torch.cat([x["preds"] for x in outputs]).view(-1, self.args.max_num_spans)#.cpu().detach().tolist()
+        test_labels = torch.cat([x["labels"] for x in outputs]).view(-1, self.args.max_num_spans)#.cpu().detach().tolist()
 
         pred_indices = torch.nonzero(test_preds).squeeze()
         target_indices = torch.nonzero(test_labels).squeeze()
@@ -755,12 +766,12 @@ checkpoint_callback = pl.callbacks.ModelCheckpoint(
 
 early_stop_callback = EarlyStopping(monitor="val_loss", patience=8, verbose=False, mode="min")
 
-#model = NERLongformer(args)
+model = NERLongformer(args)
 
-trained_model_path = bucket_ops.get_file(
-            remote_path="s3://experiment-logging/storage/SpanClassifier/EntitySpanClassifier.206d902b9b8f4c05ae5ca1bfd93f3fbf/models/best_entity_lm-v2.ckpt"
-            )
-model = NERLongformer.load_from_checkpoint(trained_model_path, args = args)
+# trained_model_path = bucket_ops.get_file(
+#             remote_path="s3://experiment-logging/storage/SpanClassifier/EntitySpanClassifier.206d902b9b8f4c05ae5ca1bfd93f3fbf/models/best_entity_lm-v2.ckpt"
+#             )
+# model = NERLongformer.load_from_checkpoint(trained_model_path, args = args)
 
 trainer = pl.Trainer(gpus=1, max_epochs=args.num_epochs, callbacks=[checkpoint_callback, early_stop_callback])
 
