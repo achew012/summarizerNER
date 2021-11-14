@@ -78,6 +78,7 @@ class DiceLoss(nn.Module):
         return loss
 
     def _compute_dice_loss(self, flat_input, flat_target):
+        # Weighted with Decaying factor in eqn (12) of paper
         flat_input = ((1 - flat_input) ** self.alpha) * flat_input
         interection = torch.sum(flat_input * flat_target, -1)
         if not self.square_denominator:

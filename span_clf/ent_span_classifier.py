@@ -11,8 +11,8 @@ config={
     "width_embed_len": 300,
     "lr": 3e-5,
     "num_epochs": 5,
-    "train_batch_size": 2,
-    "eval_batch_size": 2,
+    "train_batch_size": 4,
+    "eval_batch_size": 4,
     "max_length": 1024, # be mindful underlength will cause device cuda side error
     "max_span_len": 6,
     "max_num_spans":1024*3,
@@ -23,7 +23,7 @@ config={
 args = argparse.Namespace(**config)
 
 Task.add_requirements("transformers", package_version="4.1.0") 
-task = Task.init(project_name='SpanClassifier', task_name='EntitySpanClassifier', tags=["multiclass", "maxpool", args.dataset], output_uri="s3://experiment-logging/storage/")
+task = Task.init(project_name='SpanClassifier', task_name='EntitySpanClassifier', tags=["binary","maxpool", args.dataset], output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
 task.connect(args)
@@ -99,17 +99,32 @@ from typing import Callable, Any, Dict, List, Tuple, Optional, Sequence, Tuple, 
 # from loss.focal_loss import FocalLoss
 # from loss.dice_loss import DiceLoss
 
-class WeightedFocalLoss(nn.modules.loss._WeightedLoss):
-    def __init__(self, alpha=None, gamma=2,reduction='none'):
-        super(WeightedFocalLoss, self).__init__(alpha,reduction=reduction)
+class WeightedFocalLoss(nn.Module):
+    "Non weighted version of Focal Loss"
+    def __init__(self, alpha=.25, gamma=2):
+        super(WeightedFocalLoss, self).__init__()
+        self.alpha = torch.tensor([alpha, 1-alpha]).cuda()
         self.gamma = gamma
-        self.weight = alpha #weight parameter will act as the alpha parameter to balance class weights
 
-    def forward(self, input, target):
-        ce_loss = F.cross_entropy(input, target.type(torch.cuda.LongTensor),reduction=self.reduction, weight=self.weight)
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
-        return focal_loss
+    def forward(self, inputs, targets):
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        targets = targets.type(torch.long)
+        at = self.alpha.gather(0, targets.data.view(-1))
+        pt = torch.exp(-BCE_loss)
+        F_loss = at*(1-pt)**self.gamma * BCE_loss
+        return F_loss.mean()
+
+# class WeightedFocalLoss(nn.modules.loss._WeightedLoss):
+#     def __init__(self, alpha=None, gamma=2,reduction='none'):
+#         super(WeightedFocalLoss, self).__init__(alpha,reduction=reduction)
+#         self.gamma = gamma
+#         self.weight = alpha #weight parameter will act as the alpha parameter to balance class weights
+
+#     def forward(self, input, target):
+#         ce_loss = F.cross_entropy(input, target.type(torch.cuda.LongTensor),reduction=self.reduction, weight=self.weight)
+#         pt = torch.exp(-ce_loss)
+#         focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
+#         return focal_loss
 
 class ConfigurationError(Exception):
     """
@@ -391,7 +406,7 @@ class DWIE_Data(Dataset):
         }
 
 class NERDataset(Dataset):
-    def __init__(self, dataset, tokenizer, args, labels2idx):
+    def __init__(self, dataset, tokenizer, args):
         self.args = args
         self.dataset = dataset
         self.tokenizer = tokenizer
@@ -433,15 +448,15 @@ class NERDataset(Dataset):
             role_ans = [[key, mention[1] if len(mention)>0 else 0, mention[1]+len(mention[0]) if len(mention)>0 else 0, mention[0] if len(mention)>0 else ""] for key in doc["extracts"].keys() for cluster in doc["extracts"][key] for mention in cluster]    
 
             entity_spans, entity_class = get_entity_token_id(context_encodings, role_ans)
-            entity_class = [labels2idx[entity] for entity in entity_class]
             entity_spans = [span for span in entity_spans if span!=[0,0,0]]
-            labels = [entity_class[entity_spans.index(list(span))] if (list(span) in entity_spans) else 0.0 for span in spans]
+            labels = [1.0 if (list(span) in entity_spans) else 0.0 for span in spans]
 
             self.processed_dataset["input_ids"].append(context_encodings["input_ids"]),
             self.processed_dataset["attention_mask"].append(context_encodings["attention_mask"]),
             self.processed_dataset["spans"].append(torch.tensor(spans))
             self.processed_dataset["labels"].append(torch.tensor(labels))
             # self.processed_dataset["span_len_mask"].append(torch.stack(span_len_mask))
+
  
     def __len__(self):
         return len(self.processed_dataset["input_ids"])
@@ -473,9 +488,7 @@ class NERDataset(Dataset):
 class NERLongformer(pl.LightningModule):
     def __init__(self, args):
         super().__init__()
-        self.args=args
-        self.labels2idx = {"NonEntity": 0.0, 'PerpInd':1.0, 'PerpOrg':2.0, 'Target':3.0, 'Victim':4.0, "Weapon":5.0}
-        
+        self.args=args        
         self.config = LongformerConfig.from_pretrained('allenai/longformer-base-4096')
         self.config.gradient_checkpointing = True
 
@@ -483,15 +496,17 @@ class NERLongformer(pl.LightningModule):
         self.tokenizer.model_max_length = self.args.max_length
 
         self.longformer = LongformerModel.from_pretrained('allenai/longformer-base-4096', config=self.config)
+        #self.longformerMLM = LongformerForMaskedLM.from_pretrained('allenai/longformer-base-4096', output_hidden_states=True)
 
         self.lm_head = LongformerLMHead(self.config) 
         self.dropout = nn.Dropout(0.1)
  
         self.classifier = nn.Sequential(
-            nn.Linear(self.config.hidden_size*3+self.args.width_embed_len, self.config.hidden_size),
+            nn.Linear(self.config.hidden_size*2+self.args.width_embed_len, self.config.hidden_size),
             nn.ReLU(),
-            nn.Linear(self.config.hidden_size, len(self.labels2idx)),
-            nn.Softmax(dim=-1)
+            nn.Linear(self.config.hidden_size, 1),
+            nn.Sigmoid(),
+            #nn.Softmax(dim=-1)
          )
         # self.size_embeddings = nn.Embedding(self.args.max_span_len, self.config.hidden_size)
         self.width_embedding = nn.Embedding(self.args.max_span_len+1, self.args.width_embed_len)
@@ -499,7 +514,7 @@ class NERLongformer(pl.LightningModule):
     def test_dataloader(self):
         if self.args.dataset=="muc4":
             test = muc4["test"]
-            test_data = NERDataset(test, self.tokenizer, self.args, self.labels2idx)
+            test_data = NERDataset(test, self.tokenizer, self.args)
         else:
             test = dwie["test"]
             test_data = DWIE_Data(test, self.tokenizer, self.args)
@@ -510,7 +525,7 @@ class NERLongformer(pl.LightningModule):
     def val_dataloader(self):
         if self.args.dataset=="muc4":
             val = muc4["val"]
-            val_data = NERDataset(val, self.tokenizer, self.args, self.labels2idx)
+            val_data = NERDataset(val, self.tokenizer, self.args)
         else:
             val = dwie["test"]
             val_data = DWIE_Data(val, self.tokenizer, self.args)
@@ -520,7 +535,7 @@ class NERLongformer(pl.LightningModule):
     def train_dataloader(self):
         if self.args.dataset=="muc4":
             train = muc4["train"]
-            train_data = NERDataset(train, self.tokenizer, self.args, self.labels2idx)
+            train_data = NERDataset(train, self.tokenizer, self.args)
         else:
             train = dwie["train"]
             train_data = DWIE_Data(train, self.tokenizer, self.args)
@@ -576,7 +591,7 @@ class NERLongformer(pl.LightningModule):
         cls_token_embedding = sequence_output[:, 0].unsqueeze(1).repeat(1, 3072, 1)
 
         # Concatenate embeddings of left/right points and the width embedding
-        spans_embedding = torch.cat((cls_token_embedding, spans_start_embedding, spans_end_embedding, spans_width_embedding), dim=-1)
+        spans_embedding = torch.cat((spans_start_embedding, spans_end_embedding, spans_width_embedding), dim=-1)
         """
         spans_embedding: (batch_size, num_spans, hidden_size*2+embedding_dim)
         """
@@ -610,13 +625,16 @@ class NERLongformer(pl.LightningModule):
         # #combined_embeds = torch.cat([cls_output.unsqueeze(1).repeat(1, 40, 1), maxpooled_embeddings], dim=-1) #(bs, num_samples, 2*768)
         # combined_embeds = torch.cat([span_len_embeddings, maxpooled_embeddings], dim=-1) #(bs, num_samples, 2*768)
  
-        logits = self.classifier(span_embeds).squeeze()        
+        logits = self.classifier(span_embeds)     
 
         masked_lm_loss = None        
         span_clf_loss = None
         if labels!=None:
-            loss_fct = WeightedFocalLoss(alpha=torch.cuda.FloatTensor([0.01, 1, 1, 1, 1, 1]), gamma=self.args.gamma)
-            span_clf_loss = loss_fct(logits.view(-1, len(self.labels2idx)), labels.view(-1))
+            #loss_fct = WeightedFocalLoss(alpha=torch.cuda.FloatTensor([0.01, 1, 1, 1, 1, 1]), gamma=self.args.gamma)
+            #span_clf_loss = loss_fct(logits.view(-1, len(self.labels2idx)), labels.view(-1))
+            
+            loss_fct = WeightedFocalLoss(alpha=0.1, gamma=self.args.gamma)            
+            span_clf_loss = loss_fct(logits.view(-1), labels.view(-1))
 
             total_loss+=span_clf_loss
  
@@ -633,7 +651,6 @@ class NERLongformer(pl.LightningModule):
         #input_ids, attention_mask, labels = batch
         loss, logits = self(**batch)
         preds = (logits>0.5).long()
-        #preds = torch.argmax(logits, dim=-1)
         return {"val_loss": loss, "preds": preds, "labels": batch["labels"]}
  
     def validation_epoch_end(self, outputs):
@@ -665,7 +682,6 @@ class NERLongformer(pl.LightningModule):
         # clearlogger.report_text(logits)
         #clearlogger.report_scalar(title='mlm_loss', series = 'val', value=masked_lm_loss, iteration=batch_idx) 
         preds = (logits>0.5).long()
-        #preds = torch.argmax(logits, dim=-1)
         return {"test_loss": loss, "preds": preds, "labels": batch["labels"], "spans": batch["spans"]}
 
     def test_epoch_end(self, outputs):
